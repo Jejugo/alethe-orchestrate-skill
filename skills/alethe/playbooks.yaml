@@ -107,7 +107,7 @@ playbooks:
         who: lead
         tier: strong
         readOnly: true
-        does: Read the task; unless it is narrow, split it into bounded units and tag each one with a kind and an effort class.
+        does: Read the task; unless it is narrow, split it into bounded units and tag each one with a kind and an effort class. A unit that is part of an important feature that must be tested is risky or deep, never light.
       - id: quick
         role: do it yourself
         who: lead
@@ -144,6 +144,23 @@ playbooks:
             use: { tier: standard }
           - if: light
             use: { tier: cheap }
+      - id: test
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        if: risky
+        does: Write or update tests that cover the unit's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+      - id: test-deep
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        with: test
+        if: deep
+        does: Write or update tests that cover the unit's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
       - id: review
         role: reviewer
         tier: standard
@@ -151,7 +168,7 @@ playbooks:
         readOnly: true
         runner: economy
         does: Review the finished diff against the plan and the repository rules.
-        gate: Checks pass and the diff matches the plan.
+        gate: Checks pass, including any new tests, and the diff matches the plan.
       - id: fix
         role: fixer
         tier: strong

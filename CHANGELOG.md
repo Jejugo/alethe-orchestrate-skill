@@ -22,6 +22,10 @@ Added:
   readable feed per worker (`follow`), each shown in Herdr's sidebar; elsewhere it prints a
   refreshing summary table. `policy set --watch on` (`/alethe watch on`) opens the tab for every
   wave; it is off by default and never blocks a run. Lives in `scripts/watch.py`.
+- The `complete` playbook gains a `test` phase between `build` and `review`: for a unit tagged
+  `risky` or `deep`, a tester writes or updates tests and runs the full suite, and the review gate
+  now requires the new tests to pass. The planner tags units of an important feature that must be
+  tested as `risky` or `deep`.
 - Profile field `only` keeps every worker on the listed providers, such as a Claude-only profile
   running haiku, sonnet and opus by tier; the runner refuses plans that pin another provider.
 
