@@ -18,6 +18,10 @@ Added:
   worktree. Codex workers run with `--no-daemon` when available. `trust.defaultPermissions`
   (`policy set --default-permissions`, `/alethe trust default <level>`) sets the level writers get
   unless they ask for less; a default `full` that cannot isolate steps down to `network`.
+- `watch` follows a wave live: inside Herdr it opens a background tab with a summary pane and one
+  readable feed per worker (`follow`), each shown in Herdr's sidebar; elsewhere it prints a
+  refreshing summary table. `policy set --watch on` (`/alethe watch on`) opens the tab for every
+  wave; it is off by default and never blocks a run. Lives in `scripts/watch.py`.
 
 ## 24 (2026-11-04)
 

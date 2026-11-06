@@ -170,6 +170,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "modelTiers": {},
     "trust": {"allowUnsafe": False, "cwdRoots": [], "workerEnv": [], "maxPermissions": {}, "defaultPermissions": "standard"},
     "classifier": {"mode": "off", "model": "~typesafe/jev-latest", "endpoint": "https://openrouter.ai/api/alpha/decisions"},
+    "watch": "off",
 }
 CLASSIFIER_MODES = ("off", "shadow", "on")
 # Worker permission levels, lowest first. "network" adds network and shell/web tools;
@@ -1879,6 +1880,12 @@ def validate_classifier(raw: Any) -> Dict[str, Any]:
     return {"mode": mode, "model": model, "endpoint": endpoint}
 
 
+def validate_watch(value: Any) -> str:
+    if value not in ("on", "off"):
+        raise PlanError("policy.watch must be on or off")
+    return value
+
+
 def validate_policy(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise PlanError("policy must be a JSON object")
@@ -1926,6 +1933,7 @@ def validate_policy(raw: Any) -> Dict[str, Any]:
         "modelTiers": validate_model_tiers(raw.get("modelTiers"), "policy.modelTiers"),
         "trust": validate_trust(raw.get("trust")),
         "classifier": validate_classifier(raw.get("classifier")),
+        "watch": validate_watch(raw.get("watch", "off")),
     }
 
 
@@ -4089,6 +4097,37 @@ def wave_dirs(folder: Path) -> List[Path]:
     return sorted(child for child in folder.iterdir() if (child / "state.json").is_file())
 
 
+def watch_module() -> Any:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import watch
+    finally:
+        sys.path.pop(0)
+    return watch
+
+
+def watch_target(raw: Optional[Path]) -> Path:
+    folder = resolve_folder(raw)
+    waves = wave_dirs(folder)
+    if not waves:
+        raise PlanError(f"{folder} has no wave to watch yet")
+    running = [wave for wave in waves if (read_optional_json(wave / "state.json") or {}).get("status") == "running"]
+    return (running or waves)[-1]
+
+
+def auto_watch(run_dir: Path, policy_path: Path) -> Optional[Dict[str, Any]]:
+    """Open Herdr panes for a new wave when the user turned watch on; never blocks the run."""
+    try:
+        if load_policy(policy_path)["watch"] != "on":
+            return None
+        views = watch_module()
+        if not views.in_herdr():
+            return None
+        return views.open_herdr(run_dir, Path(__file__).resolve())
+    except Exception as error:  # a viewer problem must never stop workers
+        return {"error": str(error)[:300]}
+
+
 def next_wave_dir(folder: Path, phase: Any) -> Path:
     if (folder / "state.json").is_file():
         raise PlanError(f"{folder} is a single run; start an orchestration with new to add waves")
@@ -5143,7 +5182,11 @@ def detach_run(
         process.kill()
         process.wait()
         raise
-    return {"status": "started", "runDir": str(target), "pid": process.pid}
+    started: Dict[str, Any] = {"status": "started", "runDir": str(target), "pid": process.pid}
+    watching = auto_watch(target, policy_path)
+    if watching:
+        started["watch"] = watching
+    return started
 
 
 def wait_payload(folder: Optional[Path], timeout: int) -> Dict[str, Any]:
@@ -6449,6 +6492,8 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
         if args.classifier_model:
             classifier["model"] = args.classifier_model
         policy["classifier"] = validate_classifier(classifier)
+    if args.watch:
+        policy["watch"] = args.watch
     if args.default_permissions:
         policy["trust"] = validate_trust({**policy["trust"], "defaultPermissions": args.default_permissions})
     if args.max_permissions:
@@ -6490,7 +6535,7 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
                     raise PlanError(f"expected PROVIDER={key.upper()}, got {pair!r}")
                 tiers.setdefault(tier, {}).setdefault(provider.strip(), {})[key] = value.strip()
     policy["modelTiers"] = validate_model_tiers(tiers, "policy.modelTiers")
-    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions")
+    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions", "watch")
     classifier_only = any(getattr(args, name) for name in side_settings) and not any(
         value not in (None, False) for name, value in vars(args).items()
         if name not in ("command", "policy_action", "file", *side_settings)
@@ -6595,6 +6640,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     status_parser.add_argument("runs", nargs="*", type=Path)
     status_parser.add_argument("--policy", type=Path)
     status_parser.add_argument("--format", choices=["text", "json"], default="text")
+    watch_parser = subparsers.add_parser(
+        "watch", help="follow a wave live: Herdr panes per worker inside Herdr, otherwise a summary table"
+    )
+    watch_parser.add_argument("target", nargs="?", type=Path, help="wave or orchestration folder; default: current")
+    watch_parser.add_argument("--here", action="store_true", help="show the summary table in this terminal")
+    watch_parser.add_argument("--once", action="store_true", help="print the summary once and exit")
+    follow_parser = subparsers.add_parser("follow", help="print one worker's activity as readable lines until it ends")
+    follow_parser.add_argument("run_dir", type=Path)
+    follow_parser.add_argument("worker")
     wait_parser = subparsers.add_parser("wait", help="wait for running waves to finish")
     wait_parser.add_argument("folder", nargs="?", type=Path)
     wait_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_SECONDS)
@@ -6673,6 +6727,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                help="highest worker permissions per provider: standard, network or full; only at the user's request")
     policy_parser.add_argument("--default-permissions", choices=list(PERMISSION_LEVELS),
                                help="permissions for writing workers that do not ask; only at the user's request")
+    policy_parser.add_argument("--watch", choices=["on", "off"],
+                               help="open live Herdr panes for every wave when running inside Herdr")
     policy_parser.add_argument("--classifier", choices=list(CLASSIFIER_MODES),
                                help="Jev classifier: off, shadow (classify and log only) or on")
     policy_parser.add_argument("--classifier-model", help="Jev model id, such as ~typesafe/jev-latest")
@@ -6758,6 +6814,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "wait":
             print(json.dumps(wait_payload(args.folder, args.timeout), indent=2, ensure_ascii=False))
             return 0
+        if args.command == "watch":
+            run_dir = watch_target(args.target)
+            views = watch_module()
+            if args.here or args.once or not views.in_herdr():
+                return views.summary(run_dir, reported_total_tokens, once=args.once)
+            try:
+                print(json.dumps({"runDir": str(run_dir), **views.open_herdr(run_dir, Path(__file__).resolve())}, indent=2))
+            except RuntimeError as error:
+                raise PlanError(str(error)) from None
+            return 0
+        if args.command == "follow":
+            run_dir = args.run_dir.expanduser().resolve()
+            if not (run_dir / "plan.json").is_file() or not ID_PATTERN.fullmatch(args.worker):
+                raise PlanError("follow needs a wave folder with plan.json and a worker id")
+            try:
+                return watch_module().follow(run_dir, args.worker)
+            except KeyboardInterrupt:
+                return 130
         if args.command == "new":
             print(json.dumps(new_orchestration(args.title, args.playbook, args.why, args.lead), indent=2, ensure_ascii=False))
             return 0

@@ -1,7 +1,7 @@
 ---
 name: alethe
 description: Orchestrate bounded Codex, Claude Code, Agy, Kimi, or custom CLI workers to finish work with the least lead context and provider usage, following playbooks such as plan big, execute small. Use when the user asks to orchestrate, delegate, compare agents, conserve agent tokens or quota, recover a worker, report what an orchestration did and cost, or work without MCP or Python, when the user types /alethe or a short command such as "alethe report" or "alethe stop", and when they want it on from now on, at any point of a task and alongside other skills. Also use it proactively, without being asked, when a request is large enough to split into bounded independent units, such as a multi-file refactor, a migration, an audit or research across many files. Default passive mode watches session spend and quota and delegates cheaper bounded units; spend reports the lead session. Keep small work with the lead.
-argument-hint: "[task or standing instruction] | on | off | passive | spend | save | max | freestyle | careful | jev on/shadow/off | trust <provider> <level> | report | status | usage | models | editor | list | stop | clean | skip <phase> | switch <playbook> | freeform | budget <limit> | mark <worker> <used|partial|discarded> | setup | help"
+argument-hint: "[task or standing instruction] | on | off | passive | spend | save | max | freestyle | careful | watch [on/off] | jev on/shadow/off | trust <provider> <level> | report | status | usage | models | editor | list | stop | clean | skip <phase> | switch <playbook> | freeform | budget <limit> | mark <worker> <used|partial|discarded> | setup | help"
 metadata:
   version: "24"
 ---
@@ -90,6 +90,8 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `editor`, or "show the playbooks" | `editor`, which writes the playbooks as a flow page and opens it; without Python, fill `assets/editor.html` as in [references/manual.md](references/manual.md) |
 | `list` | `list`; `use <folder>` makes one of them current again |
 | `stop` | `stop`, then `status` once the waves have ended |
+| `watch` | `watch` for the current wave: inside Herdr it opens a background tab with a summary pane and one live feed per worker, and prints the tab; elsewhere tell the user to run `scripts/orchestrate.py watch --here` in another terminal |
+| `watch on`, `watch off` | `policy set --watch <it>`: with `on`, every `run --detach` inside Herdr opens that tab by itself and its JSON carries `watch` |
 | `clean [--older-than DAYS] [--yes]` | preview completed folders older than 14 days; delete only with `--yes` |
 | `budget <limit>` | `budget --max-calls N`, `--max-reported-cost-usd C` or `--max-reported-tokens T` |
 | `skip <phase>`, `switch <playbook>`, `freeform`, `add <phase>` | change course as below |

@@ -52,6 +52,10 @@ Windows and macOS with Python 3.9 and 3.13, so code must stay 3.9-compatible and
   `run_worker` (process start/watch, diff capture, read-only tripwire, `classify_result`) under a
   `BudgetTracker` and quota checks (`quota_refusal`, `quota_forecast`) → per-wave `state.json` and
   per-worker `outcome.json`/`result.md`/`diff.patch`.
+- `skills/alethe/scripts/watch.py` — read-only live views (`watch`, `follow`): formats each CLI's
+  JSON stream into readable lines and, inside Herdr (`HERDR_ENV=1`), opens a tab of panes through the
+  `herdr` CLI. `detach_run` calls it via `auto_watch` when `policy.watch` is `on`; failures there
+  must never stop a wave.
 - `skills/alethe/scripts/hook.py` — Claude Code hook (`hooks/hooks.json`, on `UserPromptSubmit` and
   `PostToolUse`). Must stay fast and never fail: it does cheap gating itself and imports
   `orchestrate.hook_output` only when something may print. Some helpers (e.g. `session_state_filename`,
