@@ -54,6 +54,37 @@ class EditorTest(unittest.TestCase):
         self.assertEqual(page.count(runner.EDITOR_PRICES_SLOT), 1)
         self.assertNotRegex(page, r'<(?:script|link|img)[^>]+(?:src|href)="https?:')
 
+    @unittest.skipUnless(NODE, "JavaScript resolution fixture requires Node")
+    def test_profile_only_keeps_pins_and_rules_on_allowed_providers(self):
+        source = TEMPLATE.read_text(encoding="utf-8")
+        profile = source.split("const profileNow = () =>", 1)[1].split("function tiersNow()", 1)[0]
+        roles = source.split("function applyUse(base", 1)[1].split("function nextProvider(", 1)[0]
+        javascript = r'''
+const PROVIDERS = { codex: {}, claude: {}, agy: {} };
+const state = { providers: ['codex', 'claude', 'agy'], quota: {}, profile: 'base', profiles: {
+  base: { order: ['codex', 'claude', 'agy'] },
+  'claude-only': { order: ['claude', 'codex', 'agy'], only: ['claude'] },
+} };
+const inventory = () => ['claude'], modelOwner = () => null, finalize = (u) => u;
+const profileNow = () => PROFILE_BODY
+function applyUse(base ROLES_BODY
+const review = { tier: 'standard', provider: 'codex' }, build = { tier: 'standard' };
+const out = {};
+for (const name of ['base', 'claude-only']) {
+  state.profile = name;
+  out[name] = { review: phaseBase(review).provider, build: phaseBase(build).provider,
+    rule: applyUse(phaseBase(build), { provider: 'codex', effort: 'xhigh' }) };
+}
+console.log(JSON.stringify(out));
+'''.replace("PROFILE_BODY", profile).replace("ROLES_BODY", roles)
+        result = subprocess.run([NODE, "-e", javascript], capture_output=True, text=True, check=True)
+        out = json.loads(result.stdout)
+        self.assertEqual((out["base"]["review"], out["base"]["build"], out["base"]["rule"]["provider"]),
+                         ("codex", "codex", "codex"))
+        only = out["claude-only"]
+        self.assertEqual((only["review"], only["build"], only["rule"]["provider"]), ("claude", "claude", "claude"))
+        self.assertEqual(only["rule"]["effort"], "xhigh")
+
     @unittest.skipUnless(NODE, "JavaScript DOM fixture requires Node")
     def test_trace_renders_untrusted_titles_models_and_reasons_as_text(self):
         source = TEMPLATE.read_text(encoding="utf-8")

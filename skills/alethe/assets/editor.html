@@ -696,6 +696,10 @@ function activeOrder() {
   const order = (profileNow().order ?? state.providers).filter((id) => state.providers.includes(id))
   return [...order, ...state.providers.filter((id) => !order.includes(id))]
 }
+// A profile's `only` keeps every role on those providers; pins and rules naming another one fall back.
+const onlyNow = () => (profileNow().only ?? []).filter((id) => state.providers.includes(id))
+const allowed = (id) => !onlyNow().length || onlyNow().includes(id)
+const runOrder = () => activeOrder().filter(allowed)
 function tiersNow() {
   const out = {}
   TIER_NAMES.forEach((tier) => { out[tier] = { ...(state.tiers[tier] ?? {}), ...(profileNow().tiers?.[tier] ?? {}) } })
@@ -811,7 +815,7 @@ const priceOf = (u) => (u?.model ? Number(PRICES[`${u.provider}/${u.model}`]?.in
 function applyUse(base, use = {}) {
   const next = { ...base }
   if (use.tier) { next.tier = use.tier; next.model = null; next.effort = null }
-  if (use.provider && use.provider !== next.provider) { next.provider = use.provider; next.model = null }
+  if (use.provider && use.provider !== next.provider && allowed(use.provider)) { next.provider = use.provider; next.model = null }
   if (use.model) next.model = use.model
   if (use.effort) next.effort = use.effort
   return next
@@ -819,15 +823,15 @@ function applyUse(base, use = {}) {
 const ruleFits = (r, provider) => !r.use?.model || Boolean(r.use.provider) || [null, provider].includes(modelOwner(r.use.model))
 const supports = (provider, p) => !p.readOnly || PROVIDERS[provider]?.readOnly !== false
 const leadProvider = () => inventory()[0] ?? 'claude'
-const pinOf = (p) => (p.provider && p.provider !== 'auto' && state.providers.includes(p.provider) ? p.provider : null)
+const pinOf = (p) => (p.provider && p.provider !== 'auto' && state.providers.includes(p.provider) && allowed(p.provider) ? p.provider : null)
 function phaseBase(p) {
-  const provider = p.who === 'lead' ? leadProvider() : pinOf(p) ?? activeOrder().find((id) => supports(id, p)) ?? activeOrder()[0] ?? 'claude'
+  const provider = p.who === 'lead' ? leadProvider() : pinOf(p) ?? runOrder().find((id) => supports(id, p)) ?? runOrder()[0] ?? 'claude'
   const keepModel = p.model && [null, provider].includes(modelOwner(p.model))
   return { provider, tier: p.tier ?? 'standard', model: keepModel ? p.model : null, effort: p.effort ?? null }
 }
 const subjectOf = (p) => finalize(phaseBase(p))
 function nextProvider(from, p, c) {
-  const order = activeOrder()
+  const order = runOrder()
   const start = order.indexOf(from)
   for (let i = 1; i <= order.length; i++) {
     const id = order[(start + i + order.length) % order.length]
@@ -2017,7 +2021,8 @@ function profileSection() {
   const p = profileNow()
   const lines = []
   lines.push(`Switches providers at ${Q().criticalThreshold}%.`)
-  if (p.order) lines.push(`Tries ${activeOrder().map((id) => AGENTS[id]).join(' → ')}.`)
+  if (onlyNow().length) lines.push(`Only ${onlyNow().map((id) => AGENTS[id]).join(', ')}: pins and rules naming another provider stay on ${AGENTS[onlyNow()[0]]}.`)
+  else if (p.order) lines.push(`Tries ${activeOrder().map((id) => AGENTS[id]).join(' → ')}.`)
   const changed = Object.values(p.tiers ?? {}).reduce((n, byProvider) => n + Object.keys(byProvider).length, 0)
   if (changed) lines.push(`${changed} tier models differ from base.`)
   return h('div', { className: 'section' }, [h('h4', { textContent: `Profile · ${p.name ?? state.profile}` }), h('p', { className: 'hint', textContent: p.summary ?? '' }), ...lines.map((line) => h('p', { className: 'hint', textContent: line, style: 'margin:0 0 4px' }))])
