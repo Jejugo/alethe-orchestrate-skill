@@ -361,7 +361,7 @@ PLAYBOOK_PHASE_FIELDS = {
     "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules", "permissions",
 }
 PLAYBOOK_FIELDS = {"name", "goal", "pickWhen", "saves", "avoidWhen", "source", "next", "phases"}
-PLAYBOOK_PROFILE_FIELDS = {"name", "summary", "order", "quota", "tiers"}
+PLAYBOOK_PROFILE_FIELDS = {"name", "summary", "order", "only", "quota", "tiers"}
 PLAYBOOK_PHASE_ENUMS = {
     "who": ("lead", "worker"), "tier": MODEL_TIERS,
     "runner": tuple(name for name in STRATEGIES if name != "auto"), "then": ("next", "recheck", "done"),
@@ -771,6 +771,10 @@ def playbook_structure_errors(data: Any) -> List[str]:
                 order = value["order"]
                 if len(set(order)) != len(order) or any(provider not in providers for provider in order):
                     problem(value, "order", f"{label}.order", "must contain unique ids from providers")
+            if "only" in value and strings(value["only"], value, "only", f"{label}.only"):
+                only = value["only"]
+                if not only or len(set(only)) != len(only) or any(provider not in providers for provider in only):
+                    problem(value, "only", f"{label}.only", "must list unique ids from providers")
     books = data.get("playbooks")
     if mapping(books, data, "playbooks", "playbooks"):
         for book_id, book in books.items():
@@ -878,6 +882,7 @@ def playbook_settings(policy_path: Optional[Path] = None) -> Dict[str, Any]:
     }
     order = profile.get("order", data["providers"])
     data["providers"] = [*order, *(provider for provider in data["providers"] if provider not in order)]
+    data["only"] = list(profile["only"]) if profile.get("only") else None
     data["quota"] = {**data.get("quota", {}), **profile.get("quota", {})}
     data["passive"] = {**copy.deepcopy(PASSIVE_DEFAULTS), **data.get("passive", {})}
     return data
@@ -2273,6 +2278,7 @@ def validate_plan(
         if requested_provider == "custom":
             normalized.update(validate_custom(item, worker_id, policy["trust"]))
         chosen_provider = choose_provider(requested_provider, normalized, policy)
+        chosen_provider = enforce_profile_only(requested_provider, chosen_provider, normalized, settings)
         normalized["provider"] = chosen_provider
         normalized.update(resolve_permissions(item, normalized, policy))
         if chosen_provider == requested_provider:
@@ -2326,6 +2332,25 @@ def validate_plan(
         "policy": policy,
         "workers": normalized_workers,
     }
+
+
+def enforce_profile_only(requested: str, chosen: str, worker: Dict[str, Any], settings: Dict[str, Any]) -> str:
+    """Keep every worker on the providers the active profile's `only` allows."""
+    only = settings.get("only")
+    label = Path(worker["command"]).stem if chosen == "custom" and worker.get("command") else chosen
+    if not only or label in only:
+        return chosen
+    profile = settings.get("profile", "active")
+    if requested != "auto":
+        raise PlanError(f"worker {worker['id']}: profile {profile} runs only on {', '.join(only)}, "
+                        f"but the worker pins {label}; use one of those or switch profile")
+    read_only = worker.get("mode") == "read-only"
+    available = available_builtin_providers()
+    for provider in only:
+        if provider in available and (not read_only or PROVIDER_CAPABILITIES.get(provider, {}).get("readOnly")):
+            return provider
+    raise PlanError(f"worker {worker['id']}: profile {profile} runs only on {', '.join(only)}, and none is installed "
+                    f"{'with read-only support ' if read_only else ''}here")
 
 
 def resolve_permissions(item: Dict[str, Any], worker: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:

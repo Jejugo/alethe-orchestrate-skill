@@ -22,6 +22,8 @@ Added:
   readable feed per worker (`follow`), each shown in Herdr's sidebar; elsewhere it prints a
   refreshing summary table. `policy set --watch on` (`/alethe watch on`) opens the tab for every
   wave; it is off by default and never blocks a run. Lives in `scripts/watch.py`.
+- Profile field `only` keeps every worker on the listed providers, such as a Claude-only profile
+  running haiku, sonnet and opus by tier; the runner refuses plans that pin another provider.
 
 ## 24 (2026-11-04)
 

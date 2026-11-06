@@ -97,6 +97,7 @@ The active profile changes three things and leaves the playbooks alone:
 | Field | Effect |
 |---|---|
 | `order` | Replaces the order of `providers`; providers it leaves out are tried last |
+| `only` | Runs every worker on these providers alone, such as `[claude]`. A phase or rule that names another provider runs on the first allowed one at the same tier; the runner refuses a plan that pins another. When every allowed provider is low, ask the user instead of switching |
 | `quota` | Overrides those `quota` fields |
 | `tiers` | Overrides the model and effort of the tier and provider entries it names |
 

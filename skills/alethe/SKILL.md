@@ -204,6 +204,9 @@ file for editing or onboarding only. See [references/playbooks.md](references/pl
 4. Resolve each worker's tier through the playbooks file and active profile, then apply the first
    matching rule. Deprecated `policy.modelTiers` overrides still win when set; save new tiers only
    in playbooks. Pass model and effort explicitly; keep read-only work on a capable provider.
+   Under a profile with `only`, give each worker an allowed provider: a phase `provider` or a
+   rule's `use: { provider }` naming another one runs on the first allowed provider instead,
+   keeping its tier and effort.
    When `doctor` shows `classifier.mode` other than `off`, run `classify --plan <plan>` (or
    `--task`) before `dry-run`; see [references/routing.md](references/routing.md#unit-classifier).
 5. Say which playbook you picked and why in one line before the first wave.

@@ -145,10 +145,14 @@ def check_profiles(problems, data, providers):
     if data.get("profile", "base") not in profiles:
         problems.append(f"profile {data.get('profile')!r} is not in profiles")
     for key, profile in profiles.items():
-        if set(profile) - {"name", "summary", "order", "quota", "tiers"} or not profile.get("name") or not profile.get("summary"):
+        if set(profile) - {"name", "summary", "order", "only", "quota", "tiers"} or not profile.get("name") or not profile.get("summary"):
             problems.append(f"profiles.{key}: keys {sorted(profile)}")
         if "order" in profile and (set(profile["order"]) != set(providers) or len(profile["order"]) != len(providers)):
             problems.append(f"profiles.{key}.order must list every provider once")
+        only = profile.get("only")
+        if only is not None and (not isinstance(only, list) or not only or len(set(only)) != len(only)
+                                 or not set(only) <= set(providers)):
+            problems.append(f"profiles.{key}.only must list unique ids from providers")
         check_quota(problems, profile.get("quota", {}), providers, f"profiles.{key}.quota", partial=True)
         check_tiers(problems, profile.get("tiers"), providers, f"profiles.{key}.tiers")
     return profiles
