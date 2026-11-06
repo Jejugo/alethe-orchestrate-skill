@@ -1697,6 +1697,7 @@ function phaseEditor(panel, wf, p, n) {
     panel.append(
       h('div', { className: 'row' }, [field('Workers', workers), field('Runner', selectOf(RUNNERS.map((r) => [r, r]), p.runner ?? 'economy', (v) => { p.runner = v; touched() }))]),
       h('div', { className: 'checks' }, [checkbox('read-only', Boolean(p.readOnly), (v) => { p.readOnly = v; touched() }), checkbox('own worktree', Boolean(p.isolate), (v) => { if (v) p.isolate = true; else delete p.isolate; touched() })]),
+      h('div', { className: 'row' }, [field('Permissions', selectOf([['standard', 'standard'], ['network', 'network'], ['full', 'full (own worktree)']], p.permissions ?? 'standard', (v) => { if (v === 'standard') delete p.permissions; else p.permissions = v; touched() }))]),
     )
   }
   const rules = p.rules ?? []
@@ -2134,7 +2135,7 @@ function emit(value, indent) {
   return ` ${yScalar(value)}`
 }
 const PB_KEYS = ['name', 'goal', 'pickWhen', 'saves', 'avoidWhen', 'source', 'next', 'phases']
-const PHASE_KEYS = ['id', 'role', 'who', 'tier', 'provider', 'model', 'effort', 'readOnly', 'workers', 'isolate', 'runner', 'with', 'after', 'if', 'then', 'does', 'returns', 'limit', 'gate', 'rules']
+const PHASE_KEYS = ['id', 'role', 'who', 'tier', 'provider', 'model', 'effort', 'readOnly', 'workers', 'isolate', 'permissions', 'runner', 'with', 'after', 'if', 'then', 'does', 'returns', 'limit', 'gate', 'rules']
 function ordered(obj, keys) {
   const out = {}
   keys.forEach((k) => { if (obj[k] !== undefined && obj[k] !== null) out[k] = obj[k] })

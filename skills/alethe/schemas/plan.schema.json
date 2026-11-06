@@ -83,6 +83,11 @@
         "outputFormat": { "enum": ["text", "json", "jsonl"] },
         "allowUnsafe": { "type": "boolean", "default": false },
         "mcp": { "type": "boolean", "default": false },
+        "permissions": {
+          "enum": ["standard", "network", "full"],
+          "default": "standard",
+          "description": "Requested tool permissions; the worker gets the lower of this and the saved policy's trust.maxPermissions for its provider. Not for read-only, kimi or custom workers."
+        },
         "idleTimeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 86400 }
       },
       "allOf": [
@@ -93,6 +98,10 @@
         {
           "if": { "properties": { "isolate": { "const": true } } },
           "then": { "properties": { "mode": { "const": "write" } } }
+        },
+        {
+          "if": { "required": ["permissions"], "properties": { "permissions": { "enum": ["network", "full"] } } },
+          "then": { "required": ["mode"], "properties": { "mode": { "const": "write" } } }
         }
       ]
     }

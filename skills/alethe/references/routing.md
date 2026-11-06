@@ -120,6 +120,32 @@ budgets still hold. Never lower a tier to dodge a low provider, and never run in
 changes with `note "<reason and readings>" --kind switch`. See [playbooks.md](playbooks.md) for
 conditions that still need Alethe or the user. Never infer available quota from a CLI's presence.
 
+## Unit classifier
+
+The optional Jev classifier judges the unit conditions `kind:<kind>`, `narrow`, `risky` and
+`light`/`standard`/`deep` in one cheap request per unit, through OpenRouter's decisions API. It is
+off by default and is the runner's only network access: it sends the unit's brief to OpenRouter.
+Turn it on only when the user asks, with `policy set --classifier shadow` or `on`; the OpenRouter
+key lives alone in `jev.key` next to the policy (`chmod 600`), never in a plan or a worker's
+environment. `doctor` shows the mode and whether the key is present.
+
+```text
+python scripts/orchestrate.py classify --plan plan.json
+python scripts/orchestrate.py classify --task "Add a migration that drops the legacy table"
+```
+
+Each unit returns `conditions`, the probabilities behind them, and `uncertain`: a condition whose
+answer fell between 0.3 and 0.7 (0.6 for kind and effort) is `null`, and you judge it as before.
+Results are appended to `routing.jsonl` in the current orchestration, with a hash of the brief
+instead of its text.
+
+- `shadow`: record only. Judge every condition yourself; the log lets the user compare Jev's
+  calls with yours and with what the workers' marks say was kept.
+- `on`: use the non-null conditions for `if` and `rules`, and judge only the uncertain ones. You
+  may still override a call the brief's evidence contradicts; say so with `note --kind change`.
+
+A classifier error never blocks work: say so in one line and judge the conditions yourself.
+
 ## Keep handoffs small
 
 Ask a research worker for findings with file/line or source evidence, not a narrative transcript.

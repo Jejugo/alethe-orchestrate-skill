@@ -93,8 +93,14 @@ Os workers recebem a autenticação do próprio provedor; variáveis com segredo
 são removidas. O runner exige suporte real a somente leitura, limita os diretórios de trabalho e
 arquivos de tarefa e verifica caminhos de worktrees, argumentos inseguros e a identidade dos
 processos. As chamadas internas ao git desativam hooks e fsmonitor. As exceções ficam no bloco
-`trust` da política salva (`allowUnsafe`, `cwdRoots`, `workerEnv`), alterado somente a seu pedido
-explícito; um plano não pode conceder essas permissões.
+`trust` da política salva (`allowUnsafe`, `cwdRoots`, `workerEnv`, `maxPermissions`), alterado somente
+a seu pedido explícito; um plano não pode conceder essas permissões.
+
+Workers que precisam de mais podem pedir permissões `network` ou `full` por worker ou por fase do
+playbook, até o teto que você define por provedor com `/alethe trust codex full`;
+`/alethe trust default full` torna esse o nível padrão de quem escreve, a menos que a tarefa peça menos. `full` roda cada CLI
+com a própria flag de bypass (`--dangerously-bypass-approvals-and-sandbox`,
+`--dangerously-skip-permissions`), sempre numa worktree descartável.
 
 `/alethe clean` lista pastas concluídas há mais de 14 dias. Use `clean --older-than DIAS --yes`
 para apagar as elegíveis; sessões atuais, trabalho pendente e worktrees abertas são preservados.
@@ -186,7 +192,8 @@ Qualquer outra CLI com modo não interativo, como Kiro, Copilot CLI ou Gemini CL
 - **Limites aplicados:** orçamento por wave e por orquestração, teto de custo nos workers Claude, sem subagentes.
 - **Nunca deixa a cota estourar:** lê o uso do Claude e do Codex antes de cada wave, não inicia workers passada a linha de parada e te pergunta, com opções, antes de gastar além dela.
 - **Workers enxutos e conferidos:** sem servidores MCP nos workers Codex e Claude, e o git pega um worker só leitura que escreveu.
-- **Fácil de auditar:** só a biblioteca padrão do Python, sem shell, sem rede, sem scripts de instalação.
+- **Fácil de auditar:** só a biblioteca padrão do Python, sem shell, sem scripts de instalação e sem rede,
+  a menos que você ligue o classificador Jev opcional, que avalia o tipo, o risco e o esforço de cada unidade.
 
 <p align="center">
   <picture>

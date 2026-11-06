@@ -90,8 +90,14 @@ Off modes leave a quick silent hook check; uninstall the plugin to stop the scri
 Workers get provider-specific authentication, with unrelated secret variables removed. The runner
 requires real read-only support, confines working directories and task files, and checks worktree
 paths, unsafe arguments and process identities. Internal git calls disable hooks and fsmonitor.
-Exceptions belong in the saved user policy's `trust` block (`allowUnsafe`, `cwdRoots`, `workerEnv`),
-changed only at your explicit request; a plan cannot authorize them.
+Exceptions belong in the saved user policy's `trust` block (`allowUnsafe`, `cwdRoots`, `workerEnv`,
+`maxPermissions`), changed only at your explicit request; a plan cannot authorize them.
+
+Workers that need more can ask for `network` or `full` permissions per worker or playbook phase,
+up to the ceiling you set per provider with `/alethe trust codex full`; `/alethe trust default full`
+makes it the level writers get unless a task asks for less. `full` runs each CLI with its
+own bypass flag (`--dangerously-bypass-approvals-and-sandbox`, `--dangerously-skip-permissions`),
+always in a disposable worktree.
 
 `/alethe clean` previews completed folders older than 14 days. Use `clean --older-than DAYS --yes`
 to delete eligible folders; current sessions, unfinished work and open worktrees are kept.
@@ -183,7 +189,8 @@ Any other CLI with a non-interactive mode, such as Kiro, Copilot CLI or Gemini C
 - **Enforced limits:** budgets per wave and per orchestration, a hard cost cap on Claude workers, no subagents.
 - **Never runs your quota dry:** it reads Claude and Codex usage before every wave, refuses to start workers past a stop line, and asks you, with options, before it would spend past it.
 - **Lean, checked workers:** no MCP servers in Codex and Claude workers, and git catches a read-only worker that wrote.
-- **Easy to audit:** Python's standard library only, no shell, no network, no install scripts.
+- **Easy to audit:** Python's standard library only, no shell, no install scripts, and no network
+  unless you turn on the optional Jev classifier, which judges each unit's kind, risk and effort.
 
 <p align="center">
   <picture>

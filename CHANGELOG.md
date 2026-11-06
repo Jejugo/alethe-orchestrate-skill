@@ -3,6 +3,22 @@
 The version is the integer in `skills/alethe/SKILL.md` under `metadata.version`.
 Alethe installs and updates the skill by that number.
 
+## Unreleased
+
+Added:
+
+- Optional Jev classifier (`classify`) over OpenRouter's decisions API judges each unit's
+  `kind`, `narrow`, `risky` and effort class, leaving uncertain answers to the lead. Off by
+  default; `policy set --classifier shadow|on` turns it on, the key lives in `jev.key` next to the
+  policy, and results go to `routing.jsonl` without the brief's text. It is the runner's only
+  network access and lives in `scripts/jev.py`.
+- Worker permission levels `standard`, `network` and `full`, per worker (`permissions`) or playbook
+  phase, capped per provider by the user's `trust.maxPermissions` (`policy set --max-permissions`,
+  `/alethe trust <provider> <level>`). `full` uses each CLI's bypass flag and always runs in its own
+  worktree. Codex workers run with `--no-daemon` when available. `trust.defaultPermissions`
+  (`policy set --default-permissions`, `/alethe trust default <level>`) sets the level writers get
+  unless they ask for less; a default `full` that cannot isolate steps down to `network`.
+
 ## 24 (2026-11-04)
 
 Fixed:

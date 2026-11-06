@@ -120,6 +120,7 @@ A playbook lists `phases`. Each phase is one role:
 | `readOnly` | Run workers with `mode: read-only` |
 | `workers` | Units in the wave, within the runner's limit |
 | `isolate` | Give each writer its own worktree |
+| `permissions` | `standard` (default), `network` or `full` for a writing phase; capped by the user's saved `trust.maxPermissions`. See [providers.md](providers.md#permission-levels) |
 | `runner` | The plan's runner strategy (`strategy`) for the wave: `economy`, `balanced`, `quality`, `research`, `parallel` or `rescue` |
 | `does`, `returns`, `limit` | What to put in each brief and what to ask back |
 | `gate` | What you check after the phase before moving on |
@@ -234,7 +235,8 @@ the user; for other providers, ask the user. A stale or absent reading cannot es
 Spare quota requires subscription billing (`billing` defaults to `subscription`), never API billing,
 and also needs a reset time; a non-renewing plan end comes from `quota.planEnds` or the
 user. Ignore a `planEnds` date that has passed. Task, check and report conditions are judged by
-the lead from evidence; budget conditions, `spent-above` among them, use the plan's recorded spend.
+the lead from evidence, or by the optional Jev classifier when it is on (see
+[routing.md](routing.md#unit-classifier)); budget conditions, `spent-above` among them, use the plan's recorded spend.
 `price-above` reads the price table `models` shows: the bundled `prices.json` overlaid by
 `alethe-prices.json` next to the policy, keyed `provider/model`. It is a planning choice the lead
 makes before the wave.

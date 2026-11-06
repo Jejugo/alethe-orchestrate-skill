@@ -21,8 +21,9 @@ DIALECT_CLIS = {"claude", "codex"}
 PROVIDER_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 PHASE_KEYS = {
     "id", "role", "who", "tier", "provider", "model", "effort", "readOnly", "workers", "isolate",
-    "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules",
+    "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules", "permissions",
 }
+PERMISSIONS = {"standard", "network", "full"}
 QUOTA_KEYS = {"criticalThreshold", "stopAt", "whenLow", "onBothCritical", "whenSpare", "spareWithinHours", "spareMinLeft", "planEnds"}
 ADAPTER_KEYS = {"command", "args", "promptTransport", "outputFormat", "modelFlag", "effortFlag", "checked"}
 ADAPTER_REQUIRED = {"command", "args", "promptTransport", "outputFormat", "checked"}
@@ -99,6 +100,12 @@ def check_group(problems, where, group):
         problems.append(f"{where}: research runs read-only workers only")
     if runner == "parallel" and any(not phase.get("readOnly") and not phase.get("isolate") for phase in group):
         problems.append(f"{where}: parallel needs isolate on every writer")
+    for phase in group:
+        permissions = phase.get("permissions", "standard")
+        if permissions not in PERMISSIONS:
+            problems.append(f"{where}: permissions {permissions!r}")
+        elif permissions != "standard" and phase.get("readOnly"):
+            problems.append(f"{where}: read-only phases cannot ask for {permissions} permissions")
     if runner == "rescue" and total != 1:
         problems.append(f"{where}: rescue resumes exactly one worker")
 

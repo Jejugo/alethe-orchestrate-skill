@@ -168,8 +168,15 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "maxConcurrent": 4,
     "budget": {},
     "modelTiers": {},
-    "trust": {"allowUnsafe": False, "cwdRoots": [], "workerEnv": []},
+    "trust": {"allowUnsafe": False, "cwdRoots": [], "workerEnv": [], "maxPermissions": {}, "defaultPermissions": "standard"},
+    "classifier": {"mode": "off", "model": "~typesafe/jev-latest", "endpoint": "https://openrouter.ai/api/alpha/decisions"},
 }
+CLASSIFIER_MODES = ("off", "shadow", "on")
+# Worker permission levels, lowest first. "network" adds network and shell/web tools;
+# "full" removes the CLI's sandbox and approval checks and always runs in its own worktree.
+PERMISSION_LEVELS = ("standard", "network", "full")
+PERMISSION_PROVIDERS = ("codex", "claude", "agy")
+ROUTING_FILE = "routing.jsonl"
 BUDGET_FIELDS = (
     "maxCalls",
     "maxWallSeconds",
@@ -208,6 +215,7 @@ SNAPSHOT_LIMIT = 5000
 MAX_LISTED_PATHS = 50
 NESTED_AGENT_FEATURES = ("multi_agent", "multi_agent_v2")
 CLAUDE_AGENT_TOOLS = "Agent,Workflow"
+CLAUDE_NETWORK_TOOLS = "Bash,WebFetch,WebSearch"
 WORKER_STATUSES = ("DONE", "DONE_WITH_CONCERNS", "BLOCKED", "NEEDS_CONTEXT")
 VERDICTS = ("PASS", "FAIL", "NOT_PROVEN")
 MARKS = ("used", "partial", "discarded")
@@ -349,13 +357,14 @@ PLAYBOOK_TOP_FIELDS = {
 }
 PLAYBOOK_PHASE_FIELDS = {
     "id", "role", "who", "tier", "provider", "model", "effort", "readOnly", "workers", "isolate",
-    "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules",
+    "runner", "does", "returns", "limit", "gate", "if", "with", "after", "then", "rules", "permissions",
 }
 PLAYBOOK_FIELDS = {"name", "goal", "pickWhen", "saves", "avoidWhen", "source", "next", "phases"}
 PLAYBOOK_PROFILE_FIELDS = {"name", "summary", "order", "quota", "tiers"}
 PLAYBOOK_PHASE_ENUMS = {
     "who": ("lead", "worker"), "tier": MODEL_TIERS,
     "runner": tuple(name for name in STRATEGIES if name != "auto"), "then": ("next", "recheck", "done"),
+    "permissions": PERMISSION_LEVELS,
 }
 PLAYBOOK_QUOTA_FIELDS = {
     "criticalThreshold", "stopAt", "whenLow", "onBothCritical", "whenSpare", "spareWithinHours", "spareMinLeft",
@@ -792,6 +801,8 @@ def playbook_structure_errors(data: Any) -> List[str]:
                 for field in ("readOnly", "isolate"):
                     if field in phase and not isinstance(phase[field], bool):
                         problem(phase, field, f"{where}.{field}", "must be true or false")
+                if phase.get("readOnly") is True and phase.get("permissions", "standard") != "standard":
+                    problem(phase, "permissions", f"{where}.permissions", "needs a writing phase; read-only phases stay standard")
                 if "workers" in phase and (type(phase["workers"]) is not int or not 1 <= phase["workers"] <= MAX_WORKERS):
                     problem(phase, "workers", f"{where}.workers", f"must be an integer between 1 and {MAX_WORKERS}")
                 if "provider" in phase and phase["provider"] not in [*providers, "auto"]:
@@ -1816,8 +1827,9 @@ def resolve_model_tier(
 
 def validate_trust(raw: Any) -> Dict[str, Any]:
     raw = {} if raw is None else raw
-    if not isinstance(raw, dict) or set(raw) - {"allowUnsafe", "cwdRoots", "workerEnv"}:
-        raise PlanError("policy.trust must be an object with allowUnsafe, cwdRoots and workerEnv only")
+    if not isinstance(raw, dict) or set(raw) - {"allowUnsafe", "cwdRoots", "workerEnv", "maxPermissions", "defaultPermissions"}:
+        raise PlanError("policy.trust must be an object with allowUnsafe, cwdRoots, workerEnv, maxPermissions "
+                        "and defaultPermissions only")
     unsafe = raw.get("allowUnsafe", False)
     if type(unsafe) is not bool:
         raise PlanError("policy.trust.allowUnsafe must be a boolean")
@@ -1828,8 +1840,43 @@ def validate_trust(raw: Any) -> Dict[str, Any]:
     if not isinstance(environment, list) or any(not isinstance(name, str)
             or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None for name in environment):
         raise PlanError("policy.trust.workerEnv must list environment variable names")
+    ceilings = raw.get("maxPermissions", {})
+    if not isinstance(ceilings, dict) or any(provider not in PERMISSION_PROVIDERS or level not in PERMISSION_LEVELS
+                                             for provider, level in ceilings.items()):
+        raise PlanError(f"policy.trust.maxPermissions maps {', '.join(PERMISSION_PROVIDERS)} "
+                        f"to {', '.join(PERMISSION_LEVELS)}")
+    default = raw.get("defaultPermissions", "standard")
+    if default not in PERMISSION_LEVELS:
+        raise PlanError(f"policy.trust.defaultPermissions must be one of {', '.join(PERMISSION_LEVELS)}")
     return {"allowUnsafe": unsafe, "cwdRoots": [str(Path(root).expanduser().resolve()) for root in roots],
-            "workerEnv": list(dict.fromkeys(environment))}
+            "workerEnv": list(dict.fromkeys(environment)),
+            "maxPermissions": {provider: ceilings[provider] for provider in PERMISSION_PROVIDERS if provider in ceilings},
+            "defaultPermissions": default}
+
+
+def permission_ceiling(policy: Dict[str, Any], provider: str) -> str:
+    return policy["trust"].get("maxPermissions", {}).get(provider, "standard")
+
+
+def lower_permission(first: str, second: str) -> str:
+    return min(first, second, key=PERMISSION_LEVELS.index)
+
+
+def validate_classifier(raw: Any) -> Dict[str, Any]:
+    defaults = DEFAULT_POLICY["classifier"]
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict) or set(raw) - set(defaults):
+        raise PlanError("policy.classifier must be an object with mode, model and endpoint only")
+    mode = raw.get("mode", defaults["mode"])
+    if mode not in CLASSIFIER_MODES:
+        raise PlanError(f"policy.classifier.mode must be one of {', '.join(CLASSIFIER_MODES)}")
+    model = raw.get("model", defaults["model"])
+    if not isinstance(model, str) or re.fullmatch(r"~?[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model) is None:
+        raise PlanError("policy.classifier.model must be a model id such as ~typesafe/jev-latest")
+    endpoint = raw.get("endpoint", defaults["endpoint"])
+    if not isinstance(endpoint, str) or re.fullmatch(r"https://[^\s]+", endpoint) is None:
+        raise PlanError("policy.classifier.endpoint must be an https URL")
+    return {"mode": mode, "model": model, "endpoint": endpoint}
 
 
 def validate_policy(raw: Any) -> Dict[str, Any]:
@@ -1878,6 +1925,7 @@ def validate_policy(raw: Any) -> Dict[str, Any]:
         "budget": validate_budget(raw.get("budget"), "policy.budget"),
         "modelTiers": validate_model_tiers(raw.get("modelTiers"), "policy.modelTiers"),
         "trust": validate_trust(raw.get("trust")),
+        "classifier": validate_classifier(raw.get("classifier")),
     }
 
 
@@ -2130,6 +2178,7 @@ def validate_plan(
             "allowUnsafe",
             "mcp",
             "idleTimeoutSeconds",
+            "permissions",
         }
         if unknown:
             raise PlanError(
@@ -2217,6 +2266,7 @@ def validate_plan(
             normalized.update(validate_custom(item, worker_id, policy["trust"]))
         chosen_provider = choose_provider(requested_provider, normalized, policy)
         normalized["provider"] = chosen_provider
+        normalized.update(resolve_permissions(item, normalized, policy))
         if chosen_provider == requested_provider:
             normalized["routingNote"] = None
         elif requested_provider == "auto":
@@ -2268,6 +2318,43 @@ def validate_plan(
         "policy": policy,
         "workers": normalized_workers,
     }
+
+
+def resolve_permissions(item: Dict[str, Any], worker: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
+    """Grant the lower of what the worker asks for and the user's saved ceiling for its provider.
+
+    A worker without `permissions` asks for the user's saved default; a default that cannot apply
+    (read-only, Kimi/custom, or full without a fresh isolated checkout) quietly steps down."""
+    worker_id, provider = worker["id"], worker["provider"]
+    explicit = "permissions" in item
+    requested = item["permissions"] if explicit else policy["trust"].get("defaultPermissions", "standard")
+    if requested not in PERMISSION_LEVELS:
+        raise PlanError(f"worker {worker_id} permissions must be one of {', '.join(PERMISSION_LEVELS)}")
+    standard = {"permissions": "standard", "requestedPermissions": "standard", "permissionsSource": "plan" if explicit else "default"}
+    if requested == "standard" or (not explicit and (worker["mode"] != "write" or provider not in PERMISSION_PROVIDERS)):
+        return standard
+    if worker["mode"] != "write":
+        raise PlanError(f"worker {worker_id}: permissions {requested} needs mode: write; read-only workers stay read-only")
+    if provider not in PERMISSION_PROVIDERS:
+        raise PlanError(f"worker {worker_id}: permissions apply to {', '.join(PERMISSION_PROVIDERS)}; "
+                        f"{provider} sets its own flags")
+    granted = lower_permission(requested, permission_ceiling(policy, provider))
+    source = "plan" if explicit else "default"
+    if granted == "full" and not explicit:
+        blocker = ("isolate: false" if item.get("isolate") is False else "a resumed session" if worker["resume"]
+                   else "no git checkout" if not in_git_worktree(Path(worker["cwd"])) else None)
+        if blocker:
+            return {"permissions": "network", "requestedPermissions": requested, "permissionsSource": source,
+                    "permissionsNote": f"default full stepped down to network: {blocker}"}
+    if granted == "full":
+        if item.get("isolate") is False:
+            raise PlanError(f"worker {worker_id}: full permissions always run in their own worktree; drop isolate: false")
+        if worker["resume"]:
+            raise PlanError(f"worker {worker_id}: full permissions need a fresh isolated session; resume at network or below")
+        if not in_git_worktree(Path(worker["cwd"])):
+            raise PlanError(f"worker {worker_id}: full permissions need a git checkout to isolate the worker in")
+        return {"permissions": "full", "requestedPermissions": requested, "permissionsSource": source, "isolate": True}
+    return {"permissions": granted, "requestedPermissions": requested, "permissionsSource": source}
 
 
 def unsafe_argument(args: Sequence[str]) -> Optional[str]:
@@ -2528,6 +2615,10 @@ def command_output(args: Sequence[str], cache: Dict[str, str], lock: threading.L
     return ""
 
 
+def exec_help(launch: Sequence[str], cache: Dict[str, str], lock: threading.Lock) -> str:
+    return command_output([*launch, "exec", "--help"], cache, lock)
+
+
 def command_help(launch: Sequence[str], cache: Dict[str, str], lock: threading.Lock) -> str:
     return command_output([*launch, "--help"], cache, lock)
 
@@ -2624,11 +2715,21 @@ def build_invocation(
         if "--disable" in help_text and not features.strip():
             raise PlanError("cannot read Codex features list to disable nested agents; repair the CLI before starting a worker")
         args = list(launch)
+        # Each worker runs on its own, not through the user's shared Codex background server.
+        if "--no-daemon" in help_text:
+            args.append("--no-daemon")
         for feature in NESTED_AGENT_FEATURES:
             if "--disable" in help_text and re.search(rf"^{feature}\s", features, re.MULTILINE):
                 args += ["--disable", feature]
-        sandbox = "read-only" if mode == "read-only" else "workspace-write"
-        args += ["exec", "--sandbox", sandbox]
+        permissions = worker.get("permissions", "standard")
+        if permissions == "full":
+            if "--dangerously-bypass-approvals-and-sandbox" not in exec_help(launch, help_cache, help_lock):
+                raise PlanError("this Codex CLI cannot bypass its sandbox; run the worker at network or standard")
+            args += ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            args += ["exec", "--sandbox", "read-only" if mode == "read-only" else "workspace-write"]
+        if permissions == "network":
+            args += ["--config", "sandbox_workspace_write.network_access=true"]
         if resume:
             args.append("resume")
         args += ["--json", "--output-last-message", str(result_path)]
@@ -2649,19 +2750,17 @@ def build_invocation(
 
     if provider == "claude":
         launch = launch_command(resolve_executable("claude"))
-        permission = "plan" if mode == "read-only" else "acceptEdits"
-        args = [
-            *launch,
-            "--print",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            permission,
-        ]
+        permissions = worker.get("permissions", "standard")
+        args = [*launch, "--print", "--output-format", "stream-json", "--verbose"]
         help_text = command_help(launch, help_cache, help_lock)
         if not help_text.strip():
             raise PlanError("cannot read Claude --help for safety flags; repair the CLI/help command before starting a worker")
+        if permissions == "full":
+            if "--dangerously-skip-permissions" not in help_text:
+                raise PlanError("this Claude CLI cannot skip permissions; run the worker at network or standard")
+            args.append("--dangerously-skip-permissions")
+        else:
+            args += ["--permission-mode", "plan" if mode == "read-only" else "acceptEdits"]
         if "--setting-sources" in help_text:
             args += ["--setting-sources", "user"]
         if "--permission-prompts" in help_text:
@@ -2670,6 +2769,10 @@ def build_invocation(
             args.append("--disable-slash-commands")
         if "--disallowedTools" in help_text:
             args += ["--disallowedTools", CLAUDE_AGENT_TOOLS]
+        if permissions == "network":
+            if "--allowedTools" not in help_text:
+                raise PlanError("this Claude CLI has no --allowedTools; run the worker at standard or full permissions")
+            args += ["--allowedTools", CLAUDE_NETWORK_TOOLS]
         if not worker["mcp"] and "--strict-mcp-config" in help_text:
             args.append("--strict-mcp-config")
         if cost_cap is not None and "--max-budget-usd" in help_text:
@@ -2684,22 +2787,22 @@ def build_invocation(
 
     if provider == "agy":
         launch = launch_command(resolve_executable("agy"))
-        agent_mode = "plan" if mode == "read-only" else "accept-edits"
+        permissions = worker.get("permissions", "standard")
+        agent_mode = "plan" if mode == "read-only" else ("auto" if permissions == "network" else "accept-edits")
         # The prompt must be attached to --print: agy otherwise treats the next flag as the
         # prompt and drops the real one.
-        args = [
-            *launch,
-            "--output-format",
-            "json",
-            "--mode",
-            agent_mode,
-            "--print-timeout",
-            f"{timeout}s",
-        ]
+        args = [*launch, "--output-format", "json"]
+        if permissions != "full":
+            args += ["--mode", agent_mode]
+        args += ["--print-timeout", f"{timeout}s"]
         help_text = command_help(launch, help_cache, help_lock)
         # agy 1.4.9 ignores --mode plan when slash expansion is disabled.
         if mode != "read-only" and "--disable-slash-commands" in help_text:
             args.append("--disable-slash-commands")
+        if permissions == "full":
+            if "--dangerously-skip-permissions" not in help_text:
+                raise PlanError("this agy CLI cannot skip permissions; run the worker at network or standard")
+            args.append("--dangerously-skip-permissions")
         if "--add-dir" in help_text:
             args += ["--add-dir", str(cwd)]
         if model:
@@ -4921,6 +5024,19 @@ def plan_warnings(plan: Dict[str, Any]) -> List[str]:
             warnings.append(
                 f"{name} runs on {worker['provider']}'s default model, which may be its most expensive; set a tier or a model"
             )
+        requested, granted = worker.get("requestedPermissions", "standard"), worker.get("permissions", "standard")
+        if worker.get("permissionsNote"):
+            warnings.append(f"{name}: {worker['permissionsNote']}")
+        elif granted != requested and worker.get("permissionsSource", "plan") == "plan":
+            warnings.append(
+                f"{name} asked for {requested} permissions, but the saved policy allows {worker['provider']} only "
+                f"{granted}; it runs at {granted}. Only the user can raise it with "
+                f"policy set --max-permissions {worker['provider']}={requested}"
+            )
+        if granted != "standard":
+            warnings.append(f"{name} runs with {granted} permissions" +
+                            (", without the CLI's sandbox or approvals, in its own worktree" if granted == "full"
+                             else ": network and shell/web tools allowed"))
         if worker["provider"] == "kimi" and worker["mode"] == "write" and not worker["isolate"]:
             warnings.append(f"{name}: Kimi writes without asking; give it isolate: true")
         if (
@@ -5228,6 +5344,10 @@ def plan_payload(
                 "effort": worker["effort"] or flag_value(custom_args, "--effort"),
                 "modelNote": worker["modelNote"],
                 "mode": worker["mode"],
+                "permissions": worker.get("permissions", "standard"),
+                "requestedPermissions": worker.get("requestedPermissions", "standard"),
+                "permissionsSource": worker.get("permissionsSource", "plan"),
+                "permissionsNote": worker.get("permissionsNote"),
                 "isolate": worker["isolate"],
                 "seedPaths": worker["seedPaths"],
                 "timeoutSeconds": worker["timeoutSeconds"],
@@ -5805,7 +5925,9 @@ def verb_for(names: Sequence[str], singular: str, plural: str) -> str:
 
 def mode_text(worker: Dict[str, Any]) -> str:
     if worker["mode"] == "write":
-        return "write, worktree" if worker["isolate"] else "write"
+        permissions = worker.get("permissions", "standard")
+        extra = "" if permissions == "standard" else f", {permissions}"
+        return ("write, worktree" if worker["isolate"] else "write") + extra
     return "read" if worker["mode"] == "read-only" else "-"
 
 
@@ -6155,8 +6277,14 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
         hints.append(f"saved policy is invalid: {error}")
     elif policy and not policy["budget"]:
         hints.append("no default budget; policy set can add hard limits such as --max-calls")
+    classifier = classifier_status(policy, policy_path)
+    if classifier["mode"] != "off" and not classifier["key"]["present"]:
+        hints.append(f"the Jev classifier is {classifier['mode']} but has no key; put the OpenRouter key in {classifier['key']['path']}")
+    elif classifier["key"]["private"] is False:
+        hints.append(f"{classifier['key']['path']} is readable by other users; run chmod 600 on it")
     usage = usage_payload(policy_path, refresh=False)
     return {
+        "classifier": classifier,
         "usage": usage,
         "usageSummary": usage_summary(usage),
         "mode": mode_payload("show", Path.cwd(), None, None, [], False),
@@ -6174,6 +6302,78 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
         "playbooks": playbooks,
         "installedProviders": installed,
         "hints": hints,
+    }
+
+
+def jev_module() -> Any:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import jev
+    finally:
+        sys.path.pop(0)
+    return jev
+
+
+def classifier_status(policy: Optional[Dict[str, Any]], policy_path: Path) -> Dict[str, Any]:
+    settings = (policy or DEFAULT_POLICY)["classifier"]
+    return {**settings, "key": jev_module().key_status(policy_path)}
+
+
+def classify_units(args: argparse.Namespace, folder: Optional[Path]) -> List[Tuple[Optional[str], str]]:
+    if args.task is not None:
+        return [(None, args.task)]
+    if args.task_file is not None:
+        try:
+            return [(None, args.task_file.read_text(encoding="utf-8"))]
+        except OSError as error:
+            raise PlanError(f"cannot read task file {args.task_file}: {error}") from error
+    raw = read_json(args.plan)
+    workers = raw.get("workers") if isinstance(raw, dict) else None
+    if not isinstance(workers, list) or not workers:
+        raise PlanError("the plan has no workers to classify")
+    plan_dir = args.plan.resolve().parent
+    units = []
+    for worker in workers:
+        if not isinstance(worker, dict):
+            raise PlanError("every plan worker must be an object")
+        task = load_task(worker, plan_dir, folder).rsplit(WORKER_CONTRACT, 1)[0]
+        units.append((optional_name(worker.get("id"), "worker.id"), task))
+    return units
+
+
+def classify_payload(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]:
+    settings = load_policy(policy_path)["classifier"]
+    if settings["mode"] == "off":
+        raise PlanError("the Jev classifier is off; with the user's consent run policy set --classifier shadow")
+    jev = jev_module()
+    try:
+        key = jev.read_key(policy_path)
+    except jev.JevError as error:
+        raise PlanError(str(error)) from None
+    folder = args.folder.expanduser().resolve() if args.folder else current_folder()
+    results = []
+    for unit, task in classify_units(args, folder):
+        try:
+            result = jev.classify(task, key, settings["model"], settings["endpoint"])
+        except jev.JevError as error:
+            raise PlanError(str(error)) from None
+        results.append({"unit": unit, **result})
+    log = None
+    if folder is not None and not args.no_log:
+        log = folder / ROUTING_FILE
+        with log.open("a", encoding="utf-8") as handle:
+            for result in results:
+                handle.write(json.dumps({"at": now_iso(), "source": "jev", "mode": settings["mode"],
+                                         **{key_: value for key_, value in result.items() if key_ != "refused"}},
+                                        ensure_ascii=False) + "\n")
+    costs = [result["usage"].get("cost") for result in results]
+    return {
+        "mode": settings["mode"],
+        "advice": ("shadow: record only; judge the conditions yourself as before" if settings["mode"] == "shadow"
+                   else "on: use these conditions; decide only the ones listed as uncertain"),
+        "units": results,
+        "reportedCost": round(sum(cost for cost in costs if isinstance(cost, (int, float))), 6),
+        "log": str(log) if log else None,
     }
 
 
@@ -6242,6 +6442,23 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
         policy["conserveProviders"] = validate_provider_list(
             args.conserve_providers, "conserve providers", allow_empty=True
         )
+    if args.classifier or args.classifier_model:
+        classifier = dict(policy["classifier"])
+        if args.classifier:
+            classifier["mode"] = args.classifier
+        if args.classifier_model:
+            classifier["model"] = args.classifier_model
+        policy["classifier"] = validate_classifier(classifier)
+    if args.default_permissions:
+        policy["trust"] = validate_trust({**policy["trust"], "defaultPermissions": args.default_permissions})
+    if args.max_permissions:
+        trust = copy.deepcopy(policy["trust"])
+        for pair in args.max_permissions:
+            provider, separator, level = pair.partition("=")
+            if not separator:
+                raise PlanError(f"expected PROVIDER=LEVEL, got {pair!r}")
+            trust["maxPermissions"][provider.strip()] = level.strip()
+        policy["trust"] = validate_trust(trust)
     if args.max_workers is not None:
         policy["maxWorkers"] = args.max_workers
     if args.max_concurrent is not None:
@@ -6273,7 +6490,13 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
                     raise PlanError(f"expected PROVIDER={key.upper()}, got {pair!r}")
                 tiers.setdefault(tier, {}).setdefault(provider.strip(), {})[key] = value.strip()
     policy["modelTiers"] = validate_model_tiers(tiers, "policy.modelTiers")
-    policy["onboarded"] = True
+    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions")
+    classifier_only = any(getattr(args, name) for name in side_settings) and not any(
+        value not in (None, False) for name, value in vars(args).items()
+        if name not in ("command", "policy_action", "file", *side_settings)
+    )
+    if not classifier_only:
+        policy["onboarded"] = True
     policy = validate_policy(policy)
     save_policy(policy_path, policy)
     return policy
@@ -6446,6 +6669,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     policy_parser.add_argument("--cheap-model", nargs="*", metavar="PROVIDER=MODEL")
     policy_parser.add_argument("--cheap-effort", nargs="*", metavar="PROVIDER=EFFORT")
     policy_parser.add_argument("--strong-model", nargs="*", metavar="PROVIDER=MODEL")
+    policy_parser.add_argument("--max-permissions", nargs="+", metavar="PROVIDER=LEVEL",
+                               help="highest worker permissions per provider: standard, network or full; only at the user's request")
+    policy_parser.add_argument("--default-permissions", choices=list(PERMISSION_LEVELS),
+                               help="permissions for writing workers that do not ask; only at the user's request")
+    policy_parser.add_argument("--classifier", choices=list(CLASSIFIER_MODES),
+                               help="Jev classifier: off, shadow (classify and log only) or on")
+    policy_parser.add_argument("--classifier-model", help="Jev model id, such as ~typesafe/jev-latest")
+    classify_parser = subparsers.add_parser(
+        "classify", help="ask the optional Jev classifier for a unit's kind, risk, size and effort"
+    )
+    classify_source = classify_parser.add_mutually_exclusive_group(required=True)
+    classify_source.add_argument("--task", help="the unit's brief as text")
+    classify_source.add_argument("--task-file", type=Path, help="a file holding the unit's brief")
+    classify_source.add_argument("--plan", type=Path, help="classify every worker of a plan")
+    classify_parser.add_argument("--folder", type=Path, help="orchestration folder for routing.jsonl; default: current")
+    classify_parser.add_argument("--no-log", action="store_true", help="do not append to routing.jsonl")
+    classify_parser.add_argument("--policy", type=Path)
     args = parser.parse_args(argv)
 
     try:
@@ -6589,6 +6829,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 atomic_write_json(args.write, plan)
             print(json.dumps(plan, indent=2))
             return 0
+        if args.command == "classify":
+            policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+            print(json.dumps(classify_payload(args, policy_path), indent=2, ensure_ascii=False))
+            return 0
         if args.command == "policy":
             policy_path = (args.file or default_policy_path()).expanduser().resolve()
             policy = update_policy(args, policy_path)
@@ -6617,6 +6861,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "provider": worker["provider"],
                         "requestedProvider": worker["requestedProvider"],
                         "mode": worker["mode"],
+                        "permissions": worker["permissions"],
                         "isolate": worker["isolate"],
                     }
                     for worker in plan["workers"]

@@ -59,11 +59,16 @@ class SecurityTest(unittest.TestCase):
         return r.build_invocation(resolved, self.root, self.root, {}, threading.Lock(), 30, cap)[0]
 
     def test_policy_trust_defaults_round_trip_and_validation(self):
-        self.assertEqual(r.load_policy(self.policy)["trust"], {"allowUnsafe": False, "cwdRoots": [], "workerEnv": []})
-        policy = {"trust": {"allowUnsafe": True, "cwdRoots": [str(self.root)], "workerEnv": ["EXTRA_TOKEN"]}}
+        self.assertEqual(r.load_policy(self.policy)["trust"],
+                         {"allowUnsafe": False, "cwdRoots": [], "workerEnv": [], "maxPermissions": {},
+                          "defaultPermissions": "standard"})
+        policy = {"trust": {"allowUnsafe": True, "cwdRoots": [str(self.root)], "workerEnv": ["EXTRA_TOKEN"],
+                            "maxPermissions": {"codex": "full"}, "defaultPermissions": "full"}}
         r.save_policy(self.policy, policy)
         self.assertEqual(r.load_policy(self.policy)["trust"], policy["trust"])
-        for trust in ({"allowUnsafe": 1}, {"cwdRoots": ["relative"]}, {"workerEnv": ["BAD=NAME"]}, {"extra": True}):
+        for trust in ({"allowUnsafe": 1}, {"cwdRoots": ["relative"]}, {"workerEnv": ["BAD=NAME"]}, {"extra": True},
+                      {"maxPermissions": {"kimi": "full"}}, {"maxPermissions": {"codex": "root"}},
+                      {"defaultPermissions": "root"}):
             with self.subTest(trust=trust), self.assertRaises(r.PlanError):
                 r.validate_policy({"trust": trust})
 

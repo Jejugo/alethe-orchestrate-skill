@@ -42,6 +42,31 @@ one. Because the prompt is an argument for them, validation refuses a task longe
 characters on Windows or 100,000 elsewhere. Keep stdout and stderr in separate files and enforce an
 external deadline even when a provider also offers its own timeout.
 
+## Permission levels
+
+A writing worker or playbook phase may ask for `permissions`. One that does not asks for the
+user's saved default (`trust.defaultPermissions`, default `standard`). Either way it gets the lower
+of that and the user's ceiling for its provider (`trust.maxPermissions`, default `standard`). Only
+the user changes both: `policy set --default-permissions full --max-permissions codex=full claude=network`.
+An explicit `permissions` lowers a single worker below the default. A default `full` that cannot
+apply, because the worker resumes a session, sets `isolate: false` or has no git checkout, steps
+down to `network` with a `dry-run` warning; an explicit `full` there is refused.
+
+| Level | Codex | Claude | Agy |
+|---|---|---|---|
+| `standard` | `exec --sandbox workspace-write` | `--permission-mode acceptEdits` | `--mode accept-edits` |
+| `network` | the same sandbox with `sandbox_workspace_write.network_access=true` | `acceptEdits` plus `--allowedTools Bash,WebFetch,WebSearch` | `--mode auto` |
+| `full` | `exec --dangerously-bypass-approvals-and-sandbox` | `--dangerously-skip-permissions` | `--dangerously-skip-permissions` |
+
+Codex workers also run with `--no-daemon` when the CLI offers it, so each one runs on its own
+instead of through the user's shared background server.
+
+`full` always runs in the worker's own worktree, needs a git checkout, and cannot resume a session.
+A CLI without the needed flag refuses the worker rather than running it lower. At every level the
+runner still removes unrelated secrets from the environment, blocks subagents and MCP servers, and
+`report` shows the level next to the mode. Read-only workers stay read-only; Kimi always approves
+every tool in prompt mode, and custom workers set their own flags under `allowUnsafe`.
+
 ## What the runner turns off
 
 - **Subagents.** Codex workers run with its `multi_agent` features disabled and Claude workers with
