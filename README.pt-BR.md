@@ -118,7 +118,7 @@ Digite depois de `/alethe`.
 | `spend` | Mostra tokens do líder e dos workers e estimativas pelo preço de tabela |
 | `freestyle` | Trabalha normal, só cuida do custo e sugere modelos mais baratos |
 | `status` | Onde está |
-| `watch` | Abre painéis ao vivo por worker no Herdr, ou uma tabela de resumo fora dele; `watch on` abre a cada rodada |
+| `watch` | Abre uma aba do Herdr por orquestração: todas as etapas com estado e custo, ao lado de painéis ao vivo dos workers da rodada atual; fora do Herdr, uma tabela. `watch on` abre sozinho |
 | `stop` | Para os workers |
 | `clean` | Lista pastas antigas concluídas; `--yes` apaga as elegíveis |
 | `report` | O que cada worker fez e custou |

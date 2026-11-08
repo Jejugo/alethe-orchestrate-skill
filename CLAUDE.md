@@ -53,8 +53,9 @@ Windows and macOS with Python 3.9 and 3.13, so code must stay 3.9-compatible and
   `BudgetTracker` and quota checks (`quota_refusal`, `quota_forecast`) → per-wave `state.json` and
   per-worker `outcome.json`/`result.md`/`diff.patch`.
 - `skills/alethe/scripts/watch.py` — read-only live views (`watch`, `follow`): formats each CLI's
-  JSON stream into readable lines and, inside Herdr (`HERDR_ENV=1`), opens a tab of panes through the
-  `herdr` CLI. `detach_run` calls it via `auto_watch` when `policy.watch` is `on`; failures there
+  JSON stream into readable lines, shows an orchestration's pipeline of playbook phases and, inside
+  Herdr (`HERDR_ENV=1`), opens one tab per orchestration through the `herdr` CLI (saved in
+  `herdr.json`; its pipeline pane swaps worker panes per wave). `detach_run` calls it via `auto_watch` when `policy.watch` is `on`; failures there
   must never stop a wave.
 - `skills/alethe/scripts/hook.py` — Claude Code hook (`hooks/hooks.json`, on `UserPromptSubmit` and
   `PostToolUse`). Must stay fast and never fail: it does cheap gating itself and imports

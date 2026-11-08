@@ -22,10 +22,19 @@ Added:
   readable feed per worker (`follow`), each shown in Herdr's sidebar; elsewhere it prints a
   refreshing summary table. `policy set --watch on` (`/alethe watch on`) opens the tab for every
   wave; it is off by default and never blocks a run. Lives in `scripts/watch.py`.
+- `watch` follows a whole orchestration: one Herdr tab per orchestration, reused across waves, with
+  a pipeline pane that lists every playbook phase as done, running, next or skipped (with the
+  reason from `note`), its workers, time, tokens and cost, beside live feeds for the current wave's
+  workers, which change as waves start. Outside Herdr, `watch --here` prints the same pipeline.
+- `watch` shows tokens and cost while a worker runs, read from its stream (Claude counts each
+  message once) and marked `~`; the cost is a list-price estimate until the CLI reports its own.
 - The `complete` playbook gains a `test` phase between `build` and `review`: for a unit tagged
   `risky` or `deep`, a tester writes or updates tests and runs the full suite, and the review gate
   now requires the new tests to pass. The planner tags units of an important feature that must be
   tested as `risky` or `deep`.
+- `plan-execute`, `scout-then-build` and `parallel-worktrees` gain the same `test` phase for
+  `risky` or `deep` work, gated on the full suite, with a `test-fix` phase when it fails. An
+  `after` that names one path of a `with` step covers whichever path ran.
 - Profile field `only` keeps every worker on the listed providers, such as a Claude-only profile
   running haiku, sonnet and opus by tier; the runner refuses plans that pin another provider.
 

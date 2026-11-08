@@ -42,6 +42,8 @@ def duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "-"
     seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
     return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
 
 
@@ -253,30 +255,101 @@ def finish(run_dir: Path, worker_id: str, state: Dict[str, Any], out: Any) -> No
 
 # ---- summary table ---------------------------------------------------------------------------
 
-def summary_rows(run_dir: Path, total_tokens: Callable[[Any], Optional[int]]) -> List[List[str]]:
+LIVE_USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+                   "cached_input_tokens", "output_tokens")
+
+
+class LiveUsage:
+    """Token usage read from a running worker's stream, before the runner records the final numbers.
+
+    Claude repeats a message's usage on every content block, so usage is kept per message id and
+    summed once. Codex reports usage on `turn.completed`; a `result` event's cost wins when present.
+    """
+
+    def __init__(self) -> None:
+        self.offsets: Dict[Path, int] = {}
+        self.messages: Dict[Path, Dict[str, Dict[str, int]]] = {}
+        self.turns: Dict[Path, List[Dict[str, int]]] = {}
+        self.costs: Dict[Path, float] = {}
+
+    def read(self, path: Path) -> tuple:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(self.offsets.get(path, 0))
+                chunk = handle.read()
+                end = chunk.rfind("\n") + 1
+                self.offsets[path] = self.offsets.get(path, 0) + len(chunk[:end].encode("utf-8", errors="replace"))
+        except OSError:
+            return None, None
+        messages = self.messages.setdefault(path, {})
+        turns = self.turns.setdefault(path, [])
+        for line in chunk[:end].splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            message = event.get("message")
+            if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+                key = str(message.get("id") or len(messages))
+                messages[key] = counts(message["usage"])
+            elif event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+                turns.append(counts(event["usage"]))
+            cost = event.get("total_cost_usd")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                self.costs[path] = float(cost)
+        parts = list(messages.values()) + turns
+        if not parts:
+            return None, self.costs.get(path)
+        keys = [key for key in LIVE_USAGE_KEYS if any(key in part for part in parts)]
+        return {key: sum(part.get(key, 0) for part in parts) for key in keys}, self.costs.get(path)
+
+
+def counts(usage: Dict[str, Any]) -> Dict[str, int]:
+    return {key: int(usage[key]) for key in LIVE_USAGE_KEYS
+            if isinstance(usage.get(key), (int, float)) and not isinstance(usage.get(key), bool) and usage[key] >= 0}
+
+
+def summary_rows(run_dir: Path, total_tokens: Callable[[Any], Optional[int]],
+                 estimate: Optional[Callable[[str, str, Dict[str, int]], Optional[float]]] = None,
+                 live: Optional[LiveUsage] = None) -> List[List[str]]:
     plan = read_json(run_dir / "plan.json") or {}
     state = read_json(run_dir / "state.json") or {}
     workers = state.get("workers") or {}
+    live = live or LiveUsage()
     rows = []
     for entry in plan.get("workers", []):
-        live = workers.get(entry.get("id")) or {}
-        metrics = live.get("metrics") if isinstance(live.get("metrics"), dict) else {}
+        live_state = workers.get(entry.get("id")) or {}
+        metrics = live_state.get("metrics") if isinstance(live_state.get("metrics"), dict) else {}
         tokens = total_tokens(metrics.get("usage"))
         cost = metrics.get("totalCostUsd")
-        elapsed = live.get("durationSeconds")
-        if elapsed is None and live.get("startedAt"):
-            started = parse_time(live["startedAt"])
+        approx = ""
+        if tokens is None and cost is None and live_state.get("status") not in (None, "queued"):
+            usage, reported = live.read(run_dir / "workers" / str(entry.get("id")) / "stdout.log")
+            if usage:
+                tokens = total_tokens(usage)
+                cost = reported
+                if cost is None and estimate:
+                    try:
+                        cost = estimate(str(entry.get("provider") or ""), str(entry.get("model") or ""), usage)
+                    except Exception:
+                        cost = None
+                approx = "~"
+        elapsed = live_state.get("durationSeconds")
+        if elapsed is None and live_state.get("startedAt"):
+            started = parse_time(live_state["startedAt"])
             elapsed = time.time() - started if started else None
-        idle = live.get("idleSeconds")
-        status = live.get("status") or "queued"
+        idle = live_state.get("idleSeconds")
+        status = live_state.get("status") or "queued"
         rows.append([
             entry.get("id", "?"),
             " · ".join(str(part) for part in (entry.get("provider"), entry.get("model")) if part),
             (entry.get("permissions") or "standard") if entry.get("mode") == "write" else "read",
             status + (f" (quiet {duration(idle)})" if status == "running" and idle and idle >= 30 else ""),
             duration(elapsed),
-            f"{tokens:,}" if tokens else "-",
-            f"${cost:.4f}" if isinstance(cost, (int, float)) else "-",
+            f"{approx}{tokens:,}" if tokens else "-",
+            f"{approx}${cost:.4f}" if isinstance(cost, (int, float)) else "-",
         ])
     return rows
 
@@ -299,20 +372,214 @@ def render_table(rows: Sequence[Sequence[str]]) -> str:
 
 
 def summary(run_dir: Path, total_tokens: Callable[[Any], Optional[int]], out: Any = None,
-            poll: float = POLL_SECONDS, once: bool = False, sleep: Callable[[float], None] = time.sleep) -> int:
+            poll: float = POLL_SECONDS, once: bool = False, sleep: Callable[[float], None] = time.sleep,
+            estimate: Optional[Callable[[str, str, Dict[str, int]], Optional[float]]] = None) -> int:
     out = out or sys.stdout
     plan = read_json(run_dir / "plan.json") or {}
     title = plan.get("title") or run_dir.name
     interactive = hasattr(out, "isatty") and out.isatty() and not once
+    live = LiveUsage()
     while True:
         state = read_json(run_dir / "state.json") or {}
-        text = f"{title}  [{state.get('status', 'starting')}]  {clock()}\n\n" + render_table(summary_rows(run_dir, total_tokens))
+        rows = summary_rows(run_dir, total_tokens, estimate, live)
+        text = f"{title}  [{state.get('status', 'starting')}]  {clock()}\n\n" + render_table(rows)
+        if any(str(cell).startswith("~") for row in rows for cell in row[5:]):
+            text += "\n\n~ live, from the worker's stream; the cost is a list-price estimate until the CLI reports it"
         if interactive:
             out.write("\x1b[H\x1b[2J" + text + "\n")
         else:
             print(text, file=out)
         out.flush()
         if once or state.get("status") not in (None, "running"):
+            return 0
+        sleep(poll)
+
+
+# ---- pipeline: every phase of an orchestration ----------------------------------------------
+
+SYMBOLS = {"done": "✓", "running": "▶", "failed": "✗", "next": "▶", "waiting": "·", "skipped": "–"}
+
+
+def wave_folders(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        return []
+    return sorted(child for child in folder.iterdir()
+                  if child.is_dir() and (child / "plan.json").is_file() and child.name[:2].isdigit())
+
+
+def wave_phase(wave: Path) -> str:
+    plan = read_json(wave / "plan.json") or {}
+    phase = plan.get("phase")
+    return str(phase) if phase else wave.name.split("-", 1)[-1]
+
+
+def current_wave(folder: Path) -> Optional[Path]:
+    waves = wave_folders(folder)
+    running = [wave for wave in waves if (read_json(wave / "state.json") or {}).get("status") in (None, "running")]
+    return (running or waves or [None])[-1]
+
+
+def read_journal(folder: Path) -> List[Dict[str, Any]]:
+    entries = []
+    try:
+        lines = (folder / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def phase_note(journal: List[Dict[str, Any]], phase_id: str, *kinds: str) -> Optional[str]:
+    for entry in reversed(journal):
+        text = str(entry.get("text") or "")
+        if entry.get("kind") in kinds and text.split(":", 1)[0].strip() == phase_id:
+            return text.split(":", 1)[1].strip() or entry.get("kind")
+    return None
+
+
+def wave_workers(wave: Path, total_tokens: Callable[[Any], Optional[int]], estimate: Any, live: LiveUsage) -> List[Dict[str, Any]]:
+    plan = read_json(wave / "plan.json") or {}
+    state = read_json(wave / "state.json") or {}
+    rows = summary_rows(wave, total_tokens, estimate, live)
+    workers = []
+    for entry, row in zip(plan.get("workers", []), rows):
+        live_state = (state.get("workers") or {}).get(entry.get("id")) or {}
+        workers.append({"id": row[0], "runsOn": row[1], "status": live_state.get("status") or "queued",
+                        "time": row[4], "tokens": row[5], "cost": row[6], "state": live_state})
+    return workers
+
+
+def worker_line(worker: Dict[str, Any]) -> str:
+    model = worker["runsOn"].split(" · ")[-1]
+    cost = worker["cost"]
+    approx = "~" if cost.startswith("~") else ""
+    if cost.lstrip("~").startswith("$"):
+        value = float(cost.lstrip("~$"))
+        cost = f"{approx}${value:.2f}" if value >= 0.01 else f"{approx}${value:.4f}"
+    return f"    {worker['id']}  {model}  {worker['status']}  {worker['time']}  {worker['tokens']}  {cost}"
+
+
+def money(cells: Iterable[str]) -> str:
+    total, approx = 0.0, False
+    for cell in cells:
+        if cell.startswith("~"):
+            approx, cell = True, cell[1:]
+        if cell.startswith("$"):
+            total += float(cell[1:])
+    return f"{'~' if approx else ''}${total:.2f}" if total else "-"
+
+
+def wave_status(workers: List[Dict[str, Any]], state: Dict[str, Any]) -> str:
+    statuses = [worker["status"] for worker in workers]
+    if state.get("status") in (None, "running") or any(status in ("running", "queued") for status in statuses):
+        return "running"
+    return "done" if all(status == "succeeded" for status in statuses) else "failed"
+
+
+def pipeline_text(folder: Path, phases: List[Dict[str, Any]], total_tokens: Callable[[Any], Optional[int]],
+                  estimate: Any = None, live: Optional[LiveUsage] = None, now: Optional[float] = None) -> str:
+    """One line per playbook phase, with the workers of each phase underneath."""
+    live = live or LiveUsage()
+    meta = read_json(folder / "orchestration.json") or {}
+    journal = read_journal(folder)
+    waves = [(wave, wave_phase(wave)) for wave in wave_folders(folder)]
+    order = [str(phase.get("id")) for phase in phases]
+    started = {name for _, name in waves} | {str(entry.get("text", "")).split(":", 1)[0].strip()
+                                             for entry in journal if entry.get("kind") == "lead"}
+    reached = max([order.index(name) for name in started if name in order] or [-1])
+    lines: List[str] = []
+    costs: List[str] = []
+    rows: List[tuple] = []
+    for index, phase in enumerate(phases):
+        name = str(phase.get("id"))
+        mine = [wave for wave, wave_name in waves if wave_name == name]
+        detail: List[str] = []
+        if mine:
+            per_wave = [wave_workers(wave, total_tokens, estimate, live) for wave in mine]
+            workers = [worker for group in per_wave for worker in group]
+            status = wave_status(per_wave[-1], read_json(mine[-1] / "state.json") or {})
+            costs.extend(worker["cost"] for worker in workers)
+            summary = f"{len(workers)} worker{'s' if len(workers) != 1 else ''}" + (f" · {len(mine)} waves" if len(mine) > 1 else "")
+            detail.extend(worker_line(worker) for worker in workers)
+        else:
+            skipped = phase_note(journal, name, "skip")
+            partners = {str(phase.get("with"))} | {str(other.get("id")) for other in phases if other.get("with") == name}
+            if not skipped and any(partner in started for partner in partners - {"None"}):
+                skipped = "another path of this step ran"
+            lead_note = phase_note(journal, name, "lead")
+            later = reached > index
+            if skipped:
+                status, summary = "skipped", f"skipped: {short(skipped, 60)}"
+            elif phase.get("who") == "lead":
+                status = "done" if (later or lead_note) else "waiting"
+                summary = "lead, in your session" + (f": {short(lead_note, 60)}" if lead_note else "")
+            elif lead_note:
+                status, summary = "done", f"done by the lead: {short(lead_note, 60)}"
+            elif phase.get("after"):
+                status = "skipped" if later and not any(p.get("after") for p in phases[index + 1:reached + 1]) else "waiting"
+                summary = f"only if {phase['after']} fails" if status == "waiting" else "not needed"
+            else:
+                condition = phase.get("if")
+                condition = " and ".join(condition) if isinstance(condition, list) else condition
+                status = "skipped" if later else "waiting"
+                summary = ("did not run" if later else "waiting") + (f" (if {condition})" if condition else "")
+        rows.append((name, phase.get("role") or "", status, summary, detail))
+    for wave, wave_name in waves:
+        if wave_name not in order:
+            workers = wave_workers(wave, total_tokens, estimate, live)
+            costs.extend(worker["cost"] for worker in workers)
+            rows.append((wave_name, "added", wave_status(workers, read_json(wave / "state.json") or {}),
+                         f"{len(workers)} worker{'s' if len(workers) != 1 else ''}",
+                         [worker_line(worker) for worker in workers]))
+    if not any(row[2] == "running" for row in rows):
+        for position, row in enumerate(rows[:len(phases)]):
+            if row[2] == "waiting" and not phases[position].get("after"):
+                rows[position] = (row[0], row[1], "next", row[3], row[4])
+                break
+    done = sum(1 for row in rows if row[2] == "done")
+    counted = sum(1 for position, row in enumerate(rows) if row[2] != "skipped"
+                  and not (position < len(phases) and phases[position].get("after") and row[2] == "waiting"))
+    width = max([len(row[0]) for row in rows] + [5])
+    role_width = max([len(row[1]) for row in rows] + [4])
+    for name, role, status, summary, detail in rows:
+        lines.append(f"{SYMBOLS.get(status, '?')} {name.ljust(width)}  {role.ljust(role_width)}  {summary}")
+        lines.extend(detail)
+    created = parse_time(str(meta.get("createdAt") or ""))
+    elapsed = duration((now or time.time()) - created) if created else "-"
+    title = meta.get("title") or folder.name
+    header = f"{title}\n{meta.get('playbook') or 'freeform'} · {elapsed} · {money(costs)} · {done} of {counted} phases done"
+    return header + "\n\n" + "\n".join(lines)
+
+
+def pipeline(folder: Path, phases: List[Dict[str, Any]], total_tokens: Callable[[Any], Optional[int]], out: Any = None,
+             poll: float = POLL_SECONDS, once: bool = False, sleep: Callable[[float], None] = time.sleep,
+             estimate: Any = None, panes: Optional["WavePanes"] = None) -> int:
+    out = out or sys.stdout
+    interactive = hasattr(out, "isatty") and out.isatty() and not once
+    live = LiveUsage()
+    while True:
+        text = pipeline_text(folder, phases, total_tokens, estimate, live)
+        if any("~$" in line or " ~" in line for line in text.splitlines()):
+            text += "\n\n~ live estimate until the CLI reports"
+        if interactive:
+            width = shutil.get_terminal_size((100, 40)).columns
+            fitted = "\n".join(line if len(line) <= width else line[: width - 1] + "…" for line in text.splitlines())
+            out.write("\x1b[H\x1b[2J" + clock() + "\n" + fitted + "\n")
+        else:
+            print(text, file=out)
+        out.flush()
+        if panes is not None:
+            try:
+                panes.sync(current_wave(folder))
+            except Exception as error:  # a pane problem must never stop the view
+                print(f"! panes: {short(error, 200)}", file=out)
+        if once:
             return 0
         sleep(poll)
 
@@ -347,28 +614,19 @@ def pane_id(response: Dict[str, Any], *path: str) -> str:
     return value
 
 
-def open_herdr(run_dir: Path, script: Path, python: str = sys.executable,
-               runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
-    """Open a background tab: the summary on the left, one feed per worker on the right."""
-    if not in_herdr():
-        raise RuntimeError("not running inside Herdr")
-    plan = read_json(run_dir / "plan.json") or {}
-    workers = [worker.get("id") for worker in plan.get("workers", []) if worker.get("id")]
-    title = plan.get("title") or plan.get("phase") or run_dir.name
+def launcher(python: str, script: Path) -> Callable[..., str]:
     # `clear` hides the long launch line, so each pane opens on its own feed.
-    command = lambda *args: "clear; " + " ".join(shlex.quote(str(part)) for part in (python, script, *args))
-    created = herdr_json(["tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"], "--cwd", str(run_dir),
-                          "--label", f"alethe: {short(title, 40)}", "--no-focus"], runner)
-    tab = pane_id(created, "tab", "tab_id")
-    summary_pane = pane_id(created, "root_pane", "pane_id")
-    herdr_json(["pane", "rename", summary_pane, "summary"], runner)
-    herdr_json(["pane", "run", summary_pane, command("watch", run_dir, "--here")], runner)
-    # Up to four rows in one column; workers five to eight sit to the right of the first four.
+    return lambda *args: "clear; " + " ".join(shlex.quote(str(part)) for part in (python, script, *args))
+
+
+def split_workers(root: str, run_dir: Path, workers: List[str], command: Callable[..., str],
+                  runner: Callable[..., Any], prefix: str = "") -> Dict[str, str]:
+    """Up to four rows in one column right of `root`; workers five to eight sit right of the first four."""
     shown, panes = workers[:MAX_HERDR_PANES], {}
     rows = min(len(shown), 4)
     for index, worker_id in enumerate(shown):
         if index == 0:
-            target, direction, ratio = summary_pane, "right", "0.35"
+            target, direction, ratio = root, "right", "0.35" if not prefix else "0.5"
         elif index < rows:
             target, direction, ratio = panes[shown[index - 1]], "down", f"{1 / (rows - index + 1):.3f}"
         else:
@@ -377,7 +635,86 @@ def open_herdr(run_dir: Path, script: Path, python: str = sys.executable,
                             "--cwd", str(run_dir), "--no-focus"], runner)
         pane = pane_id(split, "pane", "pane_id")
         panes[worker_id] = pane
-        herdr_json(["pane", "rename", pane, worker_id], runner)
+        herdr_json(["pane", "rename", pane, f"{prefix}{worker_id}"[:60]], runner)
         herdr_json(["pane", "run", pane, command("follow", run_dir, worker_id)], runner)
+    return panes
+
+
+def open_herdr(run_dir: Path, script: Path, python: str = sys.executable,
+               runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """Open a background tab: the summary on the left, one feed per worker on the right."""
+    if not in_herdr():
+        raise RuntimeError("not running inside Herdr")
+    plan = read_json(run_dir / "plan.json") or {}
+    workers = [worker.get("id") for worker in plan.get("workers", []) if worker.get("id")]
+    title = plan.get("title") or plan.get("phase") or run_dir.name
+    command = launcher(python, script)
+    created = herdr_json(["tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"], "--cwd", str(run_dir),
+                          "--label", f"alethe: {short(title, 40)}", "--no-focus"], runner)
+    tab = pane_id(created, "tab", "tab_id")
+    summary_pane = pane_id(created, "root_pane", "pane_id")
+    herdr_json(["pane", "rename", summary_pane, "summary"], runner)
+    herdr_json(["pane", "run", summary_pane, command("watch", run_dir, "--here")], runner)
+    panes = split_workers(summary_pane, run_dir, workers, command, runner)
     return {"tab": tab, "summaryPane": summary_pane, "workerPanes": panes,
             "notShown": workers[MAX_HERDR_PANES:]}
+
+
+# ---- one tab per orchestration ---------------------------------------------------------------
+
+HERDR_STATE = "herdr.json"
+
+
+class WavePanes:
+    """Keeps one feed per worker of the current wave beside the pipeline pane, replacing them per wave."""
+
+    def __init__(self, root: str, command: Callable[..., str], runner: Callable[..., Any] = subprocess.run) -> None:
+        self.root, self.command, self.runner = root, command, runner
+        self.wave: Optional[Path] = None
+        self.panes: Dict[str, str] = {}
+
+    def sync(self, wave: Optional[Path]) -> None:
+        if wave is None or wave == self.wave:
+            return
+        workers = [worker.get("id") for worker in (read_json(wave / "plan.json") or {}).get("workers", []) if worker.get("id")]
+        if not workers:
+            return
+        for pane in self.panes.values():
+            try:
+                herdr_json(["pane", "close", pane], self.runner)
+            except RuntimeError:
+                pass  # the user already closed it
+        self.wave = wave
+        self.panes = split_workers(self.root, wave, workers, self.command, self.runner, prefix=f"{wave_phase(wave)} · ")
+
+
+def pane_alive(pane: str, runner: Callable[..., Any] = subprocess.run) -> bool:
+    try:
+        herdr_json(["pane", "get", pane], runner)
+        return True
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def open_orchestration(folder: Path, script: Path, python: str = sys.executable,
+                       runner: Callable[..., Any] = subprocess.run) -> Dict[str, Any]:
+    """One background tab per orchestration: the pipeline on the left, the current wave's workers on the right.
+
+    Reuses the tab while its pipeline pane is open; the pipeline pane swaps worker panes as waves start.
+    """
+    if not in_herdr():
+        raise RuntimeError("not running inside Herdr")
+    saved = read_json(folder / HERDR_STATE) or {}
+    if saved.get("pipelinePane") and pane_alive(saved["pipelinePane"], runner):
+        return {**saved, "reused": True}
+    meta = read_json(folder / "orchestration.json") or {}
+    title = meta.get("title") or folder.name
+    created = herdr_json(["tab", "create", "--workspace", os.environ["HERDR_WORKSPACE_ID"], "--cwd", str(folder),
+                          "--label", f"alethe: {short(title, 40)}", "--no-focus"], runner)
+    tab = pane_id(created, "tab", "tab_id")
+    root = pane_id(created, "root_pane", "pane_id")
+    herdr_json(["pane", "rename", root, "pipeline"], runner)
+    herdr_json(["pane", "run", root, launcher(python, script)("watch", folder, "--here", "--panes")], runner)
+    state = {"tab": tab, "pipelinePane": root}
+    (folder / HERDR_STATE).write_text(json.dumps(state), encoding="utf-8")
+    return {**state, "reused": False}

@@ -4140,6 +4140,19 @@ def watch_target(raw: Optional[Path]) -> Path:
     return (running or waves)[-1]
 
 
+def orchestration_phases(folder: Path) -> List[Dict[str, Any]]:
+    """The phases of the orchestration's playbook, for the pipeline view; empty when freeform or unknown."""
+    playbook = (read_optional_json(folder / ORCHESTRATION_FILE) or {}).get("playbook")
+    if not playbook:
+        return []
+    try:
+        data = loaded_playbooks(default_policy_path())[1]
+    except (PlanError, OSError):
+        return []
+    phases = ((data.get("playbooks") or {}).get(playbook) or {}).get("phases")
+    return [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
+
+
 def auto_watch(run_dir: Path, policy_path: Path) -> Optional[Dict[str, Any]]:
     """Open Herdr panes for a new wave when the user turned watch on; never blocks the run."""
     try:
@@ -4148,6 +4161,8 @@ def auto_watch(run_dir: Path, policy_path: Path) -> Optional[Dict[str, Any]]:
         views = watch_module()
         if not views.in_herdr():
             return None
+        if (run_dir.parent / ORCHESTRATION_FILE).is_file():
+            return views.open_orchestration(run_dir.parent, Path(__file__).resolve())
         return views.open_herdr(run_dir, Path(__file__).resolve())
     except Exception as error:  # a viewer problem must never stop workers
         return {"error": str(error)[:300]}
@@ -4575,6 +4590,24 @@ def transcript_price(model: str, prices: Dict[str, Any]) -> Tuple[Optional[str],
     family = re.fullmatch(r"(?:claude-)?(opus|sonnet|haiku)(?:-\d[\d-]*)?", model)
     alias = "claude/" + family[1] if family else None
     return (alias, models[alias]) if alias in models else (None, None)
+
+
+def live_cost_estimator(policy: Optional[Path]) -> Optional[Callable[[str, str, Dict[str, int]], Optional[float]]]:
+    """List-price cost of a running worker's usage, for `watch`; None when no price table loads."""
+    try:
+        prices = load_prices((policy or default_policy_path()).expanduser().resolve())
+    except (PlanError, OSError):
+        return None
+
+    def estimate(provider: str, model: str, usage: Dict[str, int]) -> Optional[float]:
+        price = prices["models"].get(f"{provider}/{model}")
+        if price is None and provider == "claude" and model:
+            price = transcript_price(model, prices)[1]
+        if price is None:
+            return None
+        return priced_token_totals(normalized_usage(dict(usage)), price)["listPriceEstimateUsd"]
+
+    return estimate
 
 
 def priced_token_totals(total: Dict[str, Any], price: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -6666,11 +6699,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     status_parser.add_argument("--policy", type=Path)
     status_parser.add_argument("--format", choices=["text", "json"], default="text")
     watch_parser = subparsers.add_parser(
-        "watch", help="follow a wave live: Herdr panes per worker inside Herdr, otherwise a summary table"
+        "watch", help="follow an orchestration live: inside Herdr one tab with every phase and the current workers, otherwise a table"
     )
     watch_parser.add_argument("target", nargs="?", type=Path, help="wave or orchestration folder; default: current")
     watch_parser.add_argument("--here", action="store_true", help="show the summary table in this terminal")
     watch_parser.add_argument("--once", action="store_true", help="print the summary once and exit")
+    watch_parser.add_argument("--panes", action="store_true", help=argparse.SUPPRESS)
     follow_parser = subparsers.add_parser("follow", help="print one worker's activity as readable lines until it ends")
     follow_parser.add_argument("run_dir", type=Path)
     follow_parser.add_argument("worker")
@@ -6840,10 +6874,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(wait_payload(args.folder, args.timeout), indent=2, ensure_ascii=False))
             return 0
         if args.command == "watch":
-            run_dir = watch_target(args.target)
             views = watch_module()
+            folder = resolve_folder(args.target)
+            estimate = live_cost_estimator(getattr(args, "policy", None))
+            if (folder / ORCHESTRATION_FILE).is_file():
+                if args.here or args.once or not views.in_herdr():
+                    panes = None
+                    if args.panes and views.in_herdr() and os.environ.get("HERDR_PANE_ID"):
+                        panes = views.WavePanes(os.environ["HERDR_PANE_ID"], views.launcher(sys.executable, Path(__file__).resolve()))
+                    return views.pipeline(folder, orchestration_phases(folder), reported_total_tokens, once=args.once,
+                                          estimate=estimate, panes=panes)
+                try:
+                    print(json.dumps({"folder": str(folder), **views.open_orchestration(folder, Path(__file__).resolve())}, indent=2))
+                except RuntimeError as error:
+                    raise PlanError(str(error)) from None
+                return 0
+            run_dir = watch_target(args.target)
             if args.here or args.once or not views.in_herdr():
-                return views.summary(run_dir, reported_total_tokens, once=args.once)
+                return views.summary(run_dir, reported_total_tokens, once=args.once, estimate=estimate)
             try:
                 print(json.dumps({"runDir": str(run_dir), **views.open_herdr(run_dir, Path(__file__).resolve())}, indent=2))
             except RuntimeError as error:

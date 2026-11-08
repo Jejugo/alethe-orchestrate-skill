@@ -127,6 +127,41 @@ class FollowAndSummaryTests(unittest.TestCase):
         self.assertRegex(text, r"scout\s+codex · mini\s+read\s+succeeded\s+1m05s\s+1,200")
         self.assertRegex(text, r"build\s+claude · sonnet\s+full\s+failed\s+5s\s+-\s+\$0.2500")
 
+    def test_running_workers_show_live_usage_counted_once_per_message(self):
+        self.wave.state({"status": "running", "workers": {"scout": {"status": "running"}, "build": {"status": "running"}}})
+        usage = {"input_tokens": 10, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 1000, "output_tokens": 5}
+        self.wave.log("build",
+                      {"type": "assistant", "message": {"id": "m1", "usage": usage, "content": []}},
+                      {"type": "assistant", "message": {"id": "m1", "usage": {**usage, "output_tokens": 50}, "content": []}},
+                      {"type": "assistant", "message": {"id": "m2", "usage": usage, "content": []}})
+        self.wave.log("scout", {"type": "turn.completed", "usage": {"input_tokens": 900, "cached_input_tokens": 400,
+                                                                     "output_tokens": 100}})
+        seen = []
+        estimate = lambda provider, model, used: seen.append((provider, model, used)) or 1.5
+        live = watch.LiveUsage()
+        rows = {row[0]: row for row in watch.summary_rows(self.wave.run, orchestrate.reported_total_tokens, estimate, live)}
+        self.assertEqual(rows["build"][5:], ["~275", "~$1.5000"])
+        self.assertEqual(rows["scout"][5], "~600")
+        self.assertIn(("claude", "sonnet", {"input_tokens": 20, "cache_creation_input_tokens": 200,
+                                            "cache_read_input_tokens": 2000, "output_tokens": 55}), seen)
+        self.wave.log("build", {"type": "assistant", "message": {"id": "m3", "usage": usage, "content": []}})
+        rows = {row[0]: row for row in watch.summary_rows(self.wave.run, orchestrate.reported_total_tokens, estimate, live)}
+        self.assertEqual(rows["build"][5], "~390")
+
+    def test_final_metrics_win_over_the_live_stream(self):
+        self.wave.log("build", {"type": "assistant", "message": {"id": "m1", "usage": {"output_tokens": 9}}})
+        self.wave.state({"status": "running", "workers": {"build": {"status": "succeeded", "metrics": {
+            "usage": {"input_tokens": 1000, "output_tokens": 200}, "totalCostUsd": 0.25}}}})
+        row = watch.summary_rows(self.wave.run, orchestrate.reported_total_tokens, lambda *_: 9.0)[1]
+        self.assertEqual(row[5:], ["1,200", "$0.2500"])
+
+    def test_live_cost_uses_the_price_table(self):
+        estimate = orchestrate.live_cost_estimator(Path(self.tmp.name) / "policy.json")
+        cost = estimate("claude", "opus", {"input_tokens": 1_000_000, "output_tokens": 0})
+        prices = orchestrate.load_prices(Path(self.tmp.name) / "policy.json")["models"]
+        self.assertAlmostEqual(cost, prices["claude/opus"]["input"])
+        self.assertIsNone(estimate("kimi", "unknown-model", {"output_tokens": 5}))
+
 
 class HerdrTests(unittest.TestCase):
     def setUp(self):
@@ -175,6 +210,107 @@ class HerdrTests(unittest.TestCase):
         self.assertIn("scout · codex", self.calls[1])
 
 
+PHASES = [
+    {"id": "plan", "role": "planner", "who": "lead"},
+    {"id": "build", "role": "builder"},
+    {"id": "test", "role": "tester", "if": "risky"},
+    {"id": "test-deep", "role": "tester", "with": "test", "if": "deep"},
+    {"id": "review", "role": "reviewer"},
+    {"id": "fix", "role": "fixer", "after": "review", "if": "checks-failed"},
+]
+
+
+class Orchestration:
+    def __init__(self, root):
+        self.folder = root / "orch"
+        self.folder.mkdir()
+        (self.folder / "orchestration.json").write_text(json.dumps(
+            {"title": "Feature X", "playbook": "complete", "createdAt": "2026-11-08T10:00:00+00:00"}), encoding="utf-8")
+
+    def wave(self, name, phase, workers, status="running"):
+        wave = self.folder / name
+        for worker in workers:
+            (wave / "workers" / worker).mkdir(parents=True)
+        (wave / "plan.json").write_text(json.dumps({"phase": phase, "workers": [
+            {"id": worker, "provider": "claude", "model": "sonnet", "mode": "write"} for worker in workers]}), encoding="utf-8")
+        state = {"status": status, "workers": {worker: {"status": "succeeded" if status == "succeeded" else "running",
+                                                        "metrics": {"totalCostUsd": 0.5}} for worker in workers}}
+        (wave / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        return wave
+
+    def note(self, kind, text):
+        with (self.folder / "journal.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"kind": kind, "text": text}) + "\n")
+
+
+class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.orch = Orchestration(Path(self.tmp.name))
+
+    def text(self):
+        return watch.pipeline_text(self.orch.folder, PHASES, orchestrate.reported_total_tokens,
+                                   now=watch.parse_time("2026-11-08T11:05:00+00:00"))
+
+    def test_each_phase_shows_its_state_and_workers(self):
+        self.orch.wave("01-build", "build", ["builder-1", "builder-2"], "succeeded")
+        self.orch.wave("02-test", "test", ["tester"])
+        text = self.text()
+        self.assertIn("Feature X\ncomplete · 1h05m · $1.50 · 2 of 4 phases done", text)
+        self.assertRegex(text, r"✓ plan\s+planner\s+lead, in your session")
+        self.assertRegex(text, r"✓ build\s+builder\s+2 workers")
+        self.assertIn("    builder-2  sonnet  succeeded", text)
+        self.assertRegex(text, r"▶ test\s+tester\s+1 worker")
+        self.assertRegex(text, r"– test-deep\s+tester\s+skipped: another path of this step ran")
+        self.assertRegex(text, r"· review\s+reviewer\s+waiting")
+        self.assertRegex(text, r"· fix\s+fixer\s+only if review fails")
+
+    def test_the_lead_phase_ahead_is_marked_next(self):
+        self.assertRegex(self.text(), r"▶ plan\s+planner\s+lead, in your session")
+
+    def test_skipped_and_passed_over_phases_are_explained(self):
+        self.orch.note("skip", "test: no important feature")
+        self.orch.note("lead", "review: diff matches the plan")
+        self.orch.wave("01-build", "build", ["builder"], "succeeded")
+        text = self.text()
+        self.assertRegex(text, r"– test\s+tester\s+skipped: no important feature")
+        self.assertRegex(text, r"✓ review\s+reviewer\s+done by the lead: diff matches the plan")
+
+    def test_waves_outside_the_playbook_are_listed(self):
+        self.orch.wave("01-hotfix", "hotfix", ["patch"], "succeeded")
+        self.assertRegex(self.text(), r"✓ hotfix\s+added\s+1 worker")
+
+
+class OrchestrationPaneTests(HerdrTests):
+    def test_one_tab_per_orchestration_is_reused(self):
+        orch = Orchestration(Path(self.tmp.name))
+        opened = watch.open_orchestration(orch.folder, Path("/x/orchestrate.py"), python="py", runner=self.fake)
+        self.assertFalse(opened["reused"])
+        runs = [call[3] for call in self.calls if call[:2] == ["pane", "run"]]
+        self.assertTrue(runs[0].endswith("watch " + str(orch.folder) + " --here --panes"))
+        self.assertEqual(json.loads((orch.folder / "herdr.json").read_text())["pipelinePane"], "w9:p2")
+        self.calls.clear()
+        self.assertTrue(watch.open_orchestration(orch.folder, Path("/x/orchestrate.py"), runner=self.fake)["reused"])
+        self.assertFalse(any(call[:2] == ["tab", "create"] for call in self.calls))
+
+    def test_worker_panes_follow_the_current_wave(self):
+        orch = Orchestration(Path(self.tmp.name))
+        first = orch.wave("01-build", "build", ["builder-1", "builder-2"], "succeeded")
+        panes = watch.WavePanes("w9:p1", watch.launcher("py", Path("/x/o.py")), runner=self.fake)
+        panes.sync(first)
+        self.assertEqual(sorted(panes.panes), ["builder-1", "builder-2"])
+        self.assertIn(["pane", "rename", panes.panes["builder-1"], "build · builder-1"], self.calls)
+        old = list(panes.panes.values())
+        self.calls.clear()
+        panes.sync(first)
+        self.assertEqual(self.calls, [])
+        panes.sync(orch.wave("02-test", "test", ["tester"]))
+        closed = [call[2] for call in self.calls if call[:2] == ["pane", "close"]]
+        self.assertEqual(sorted(closed), sorted(old))
+        self.assertEqual(list(panes.panes), ["tester"])
+
+
 class PolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -197,6 +333,12 @@ class PolicyTests(unittest.TestCase):
         orchestrate.save_policy(self.policy, {"watch": "on"})
         with mock.patch.dict(os.environ, {"HERDR_ENV": ""}):
             self.assertIsNone(orchestrate.auto_watch(wave.run, self.policy))
+        orch = Orchestration(Path(self.tmp.name))
+        orch_wave = orch.wave("01-build", "build", ["builder"])
+        views = SimpleNamespace(in_herdr=lambda: True, open_orchestration=mock.Mock(return_value={"tab": "t"}))
+        with mock.patch.object(orchestrate, "watch_module", return_value=views):
+            self.assertEqual(orchestrate.auto_watch(orch_wave, self.policy), {"tab": "t"})
+        views.open_orchestration.assert_called_once_with(orch.folder, mock.ANY)
         broken = SimpleNamespace(in_herdr=lambda: True, open_herdr=mock.Mock(side_effect=RuntimeError("no server")))
         with mock.patch.object(orchestrate, "watch_module", return_value=broken):
             self.assertEqual(orchestrate.auto_watch(wave.run, self.policy), {"error": "no server"})

@@ -222,7 +222,7 @@ playbooks:
         who: lead
         tier: strong
         readOnly: true
-        does: Write numbered steps with file paths, interfaces and the check that proves each step.
+        does: Write numbered steps with file paths, interfaces and the check that proves each step. Tag it risky or deep when it is part of an important feature that must be tested.
       - id: execute
         role: executor
         tier: standard
@@ -231,6 +231,34 @@ playbooks:
         does: Follow the plan step by step; stop and report when a step is wrong instead of improvising.
         returns: Changed files, checks run, failures and risks.
         gate: Checks pass.
+      - id: test
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        if: risky
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-deep
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        with: test
+        if: deep
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-fix
+        role: fixer
+        tier: strong
+        readOnly: false
+        runner: economy
+        after: test
+        if: checks-failed
+        then: recheck
+        does: Fix the code, or a test that is wrong, from the failure excerpt; never delete or weaken a test to make it pass.
       - id: replan
         role: planner
         who: lead
@@ -329,7 +357,7 @@ playbooks:
         who: lead
         tier: strong
         readOnly: true
-        does: Turn the summaries into one concrete change plan.
+        does: Turn the summaries into one concrete change plan. Tag it risky or deep when it is part of an important feature that must be tested.
       - id: build
         role: builder
         tier: standard
@@ -347,6 +375,34 @@ playbooks:
         if: checks-failed
         then: recheck
         does: Fix from the failure excerpt and the diff.
+      - id: test
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        if: risky
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-deep
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        with: test
+        if: deep
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-fix
+        role: fixer
+        tier: strong
+        readOnly: false
+        runner: economy
+        after: test
+        if: checks-failed
+        then: recheck
+        does: Fix the code, or a test that is wrong, from the failure excerpt; never delete or weaken a test to make it pass.
 
   advisor-escalation:
     name: Advisor on call
@@ -449,7 +505,7 @@ playbooks:
         who: lead
         tier: strong
         readOnly: true
-        does: Assign disjoint files and fix the interfaces between units before anyone writes.
+        does: Assign disjoint files and fix the interfaces between units before anyone writes. Tag it risky or deep when it is part of an important feature that must be tested.
       - id: build
         role: builder
         tier: standard
@@ -475,6 +531,34 @@ playbooks:
         if: checks-failed
         then: recheck
         does: Re-plan only the failing slice.
+      - id: test
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        if: risky
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-deep
+        role: tester
+        tier: standard
+        readOnly: false
+        runner: economy
+        with: test
+        if: deep
+        does: Write or update tests that cover the change's behavior and edge cases, then run the full test suite.
+        returns: Tests added or changed, the command run, pass and fail counts, and the failure excerpt.
+        gate: The full test suite passes, including the new tests.
+      - id: test-fix
+        role: fixer
+        tier: strong
+        readOnly: false
+        runner: economy
+        after: test
+        if: checks-failed
+        then: recheck
+        does: Fix the integrated code, or a test that is wrong, from the failure excerpt; never delete or weaken a test to make it pass.
 
   best-of-n:
     name: Best of N

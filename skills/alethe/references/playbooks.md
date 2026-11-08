@@ -127,7 +127,7 @@ A playbook lists `phases`. Each phase is one role:
 | `gate` | What you check after the phase before moving on |
 | `if` | The phase runs only when the condition holds |
 | `with` | Joins that phase's step. When any path in the step has `if`, the paths are alternatives and the first whose `if` holds runs; when none has `if`, they all run in the same wave |
-| `after` | Runs only after the `gate` of that phase fails, or after that escalation phase |
+| `after` | Runs only after the `gate` of that phase fails, or after that escalation phase. Naming one path of a `with` step covers whichever path of that step ran |
 | `then` | `next` (default), `recheck` (check the gate again) or `done` (stop here) |
 | `rules` | Model choices for this role, checked top to bottom: `if` a condition, `use` a tier, provider, model or effort |
 

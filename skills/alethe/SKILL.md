@@ -90,8 +90,8 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `editor`, or "show the playbooks" | `editor`, which writes the playbooks as a flow page and opens it; without Python, fill `assets/editor.html` as in [references/manual.md](references/manual.md) |
 | `list` | `list`; `use <folder>` makes one of them current again |
 | `stop` | `stop`, then `status` once the waves have ended |
-| `watch` | `watch` for the current wave: inside Herdr it opens a background tab with a summary pane and one live feed per worker, and prints the tab; elsewhere tell the user to run `scripts/orchestrate.py watch --here` in another terminal |
-| `watch on`, `watch off` | `policy set --watch <it>`: with `on`, every `run --detach` inside Herdr opens that tab by itself and its JSON carries `watch` |
+| `watch` | `watch` for the current orchestration: inside Herdr it opens one background tab for it, with a pipeline pane listing every playbook phase (done, running, next, skipped) and its workers, beside one live feed per worker of the current wave that changes as waves start; it reuses the tab while it is open and prints it. Elsewhere tell the user to run `scripts/orchestrate.py watch --here` in another terminal. Record a step you do yourself or skip with `note`, so the pipeline shows it |
+| `watch on`, `watch off` | `policy set --watch <it>`: with `on`, the first `run --detach` of an orchestration inside Herdr opens that tab by itself, later waves reuse it, and the JSON carries `watch` |
 | `clean [--older-than DAYS] [--yes]` | preview completed folders older than 14 days; delete only with `--yes` |
 | `budget <limit>` | `budget --max-calls N`, `--max-reported-cost-usd C` or `--max-reported-tokens T` |
 | `skip <phase>`, `switch <playbook>`, `freeform`, `add <phase>` | change course as below |

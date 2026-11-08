@@ -164,7 +164,8 @@ so stale context does not increase cost or bias the answer.
 
 Start every wave with `run <plan> --in current --detach` and call `wait [--timeout N]` (at most
 540 seconds per call) until `done` is true. When its JSON carries `watch`, the user's `watch on`
-opened a Herdr tab for the wave: name the tab in one line; a `watch.error` is worth one line too,
-and never stops the wave. The panes stay open until the user closes them. Claude Code may use the shell tool's background mode
+opened the orchestration's Herdr tab, or reused it (`reused: true`): name a new tab in one line; a
+`watch.error` is worth one line too, and never stops the wave. The tab stays open until the user
+closes it; its worker panes change with each wave. Claude Code may use the shell tool's background mode
 instead. Never run a wave in the foreground of a shell tool with a short timeout. Do not run a
 reviewer in parallel with the code it must review.
