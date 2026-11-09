@@ -19,6 +19,7 @@ FINAL = ("succeeded", "failed", "timed_out", "stopped", "skipped")
 POLL_SECONDS = 1.0
 TEXT_LIMIT = 600
 MAX_HERDR_PANES = 8
+CLOSE_AFTER_SECONDS = 120
 HERDR_SOURCE = "alethe"
 
 
@@ -373,7 +374,8 @@ def render_table(rows: Sequence[Sequence[str]]) -> str:
 
 def summary(run_dir: Path, total_tokens: Callable[[Any], Optional[int]], out: Any = None,
             poll: float = POLL_SECONDS, once: bool = False, sleep: Callable[[float], None] = time.sleep,
-            estimate: Optional[Callable[[str, str, Dict[str, int]], Optional[float]]] = None) -> int:
+            estimate: Optional[Callable[[str, str, Dict[str, int]], Optional[float]]] = None,
+            closer: Optional["TabCloser"] = None) -> int:
     out = out or sys.stdout
     plan = read_json(run_dir / "plan.json") or {}
     title = plan.get("title") or run_dir.name
@@ -385,12 +387,18 @@ def summary(run_dir: Path, total_tokens: Callable[[Any], Optional[int]], out: An
         text = f"{title}  [{state.get('status', 'starting')}]  {clock()}\n\n" + render_table(rows)
         if any(str(cell).startswith("~") for row in rows for cell in row[5:]):
             text += "\n\n~ live, from the worker's stream; the cost is a list-price estimate until the CLI reports it"
+        ended = state.get("status") not in (None, "running")
+        closing = closer.update(ended and state.get("status") in FINAL) if closer is not None and not once else ""
+        if closing == "closed":
+            return 0
+        if closing:
+            text += f"\n\n{closing}"
         if interactive:
             out.write("\x1b[H\x1b[2J" + text + "\n")
         else:
             print(text, file=out)
         out.flush()
-        if once or state.get("status") not in (None, "running"):
+        if once or (ended and not closing):
             return 0
         sleep(poll)
 
@@ -482,6 +490,12 @@ def wave_status(workers: List[Dict[str, Any]], state: Dict[str, Any]) -> str:
     return "done" if all(status == "succeeded" for status in statuses) else "failed"
 
 
+def orchestration_finished(folder: Path) -> bool:
+    """True when the orchestration has waves and every one of them reached a final state."""
+    waves = wave_folders(folder)
+    return bool(waves) and all((read_json(wave / "state.json") or {}).get("status") in FINAL for wave in waves)
+
+
 def pipeline_text(folder: Path, phases: List[Dict[str, Any]], total_tokens: Callable[[Any], Optional[int]],
                   estimate: Any = None, live: Optional[LiveUsage] = None, now: Optional[float] = None) -> str:
     """One line per playbook phase, with the workers of each phase underneath."""
@@ -559,7 +573,7 @@ def pipeline_text(folder: Path, phases: List[Dict[str, Any]], total_tokens: Call
 
 def pipeline(folder: Path, phases: List[Dict[str, Any]], total_tokens: Callable[[Any], Optional[int]], out: Any = None,
              poll: float = POLL_SECONDS, once: bool = False, sleep: Callable[[float], None] = time.sleep,
-             estimate: Any = None, panes: Optional["WavePanes"] = None) -> int:
+             estimate: Any = None, panes: Optional["WavePanes"] = None, closer: Optional["TabCloser"] = None) -> int:
     out = out or sys.stdout
     interactive = hasattr(out, "isatty") and out.isatty() and not once
     live = LiveUsage()
@@ -567,6 +581,12 @@ def pipeline(folder: Path, phases: List[Dict[str, Any]], total_tokens: Callable[
         text = pipeline_text(folder, phases, total_tokens, estimate, live)
         if any("~$" in line or " ~" in line for line in text.splitlines()):
             text += "\n\n~ live estimate until the CLI reports"
+        # A new wave during the grace period makes the orchestration unfinished again, which cancels the close.
+        closing = closer.update(orchestration_finished(folder)) if closer is not None and not once else ""
+        if closing == "closed":
+            return 0
+        if closing:
+            text += f"\n\n{closing}"
         if interactive:
             width = shutil.get_terminal_size((100, 40)).columns
             fitted = "\n".join(line if len(line) <= width else line[: width - 1] + "…" for line in text.splitlines())
@@ -654,7 +674,7 @@ def open_herdr(run_dir: Path, script: Path, python: str = sys.executable,
     tab = pane_id(created, "tab", "tab_id")
     summary_pane = pane_id(created, "root_pane", "pane_id")
     herdr_json(["pane", "rename", summary_pane, "summary"], runner)
-    herdr_json(["pane", "run", summary_pane, command("watch", run_dir, "--here")], runner)
+    herdr_json(["pane", "run", summary_pane, command("watch", run_dir, "--here", "--close-tab", tab)], runner)
     panes = split_workers(summary_pane, run_dir, workers, command, runner)
     return {"tab": tab, "summaryPane": summary_pane, "workerPanes": panes,
             "notShown": workers[MAX_HERDR_PANES:]}
@@ -686,6 +706,35 @@ class WavePanes:
                 pass  # the user already closed it
         self.wave = wave
         self.panes = split_workers(self.root, wave, workers, self.command, self.runner, prefix=f"{wave_phase(wave)} · ")
+
+
+class TabCloser:
+    """Closes the Herdr tab Alethe opened once its work is finished and a grace period has passed.
+
+    `after` <= 0 never closes. Only the tab Alethe opened gets one; `watch --here` run by hand never does.
+    """
+
+    def __init__(self, tab: str, after: float = CLOSE_AFTER_SECONDS, runner: Callable[..., Any] = subprocess.run,
+                 timer: Callable[[], float] = time.monotonic) -> None:
+        self.tab, self.after, self.runner, self.timer = tab, after, runner, timer
+        self.deadline: Optional[float] = None
+
+    def update(self, finished: bool) -> str:
+        """'' while work runs (or closing is off), a countdown during the grace period, 'closed' at the end."""
+        if not finished or self.after <= 0:
+            self.deadline = None
+            return ""
+        now = self.timer()
+        if self.deadline is None:
+            self.deadline = now + self.after
+        left = self.deadline - now
+        if left > 0:
+            return f"finished · this tab closes in {duration(left)}"
+        try:
+            herdr_json(["tab", "close", self.tab], self.runner)
+        except Exception:  # the user already closed it; never fail the view
+            pass
+        return "closed"
 
 
 def pane_alive(pane: str, runner: Callable[..., Any] = subprocess.run) -> bool:

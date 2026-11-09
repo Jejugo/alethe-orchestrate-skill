@@ -311,6 +311,92 @@ class OrchestrationPaneTests(HerdrTests):
         self.assertEqual(list(panes.panes), ["tester"])
 
 
+class Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class TabCloseTests(HerdrTests):
+    def closes(self):
+        return [call for call in self.calls if call[:2] == ["tab", "close"]]
+
+    def test_a_finished_orchestration_closes_its_tab_after_the_grace_period(self):
+        orch = Orchestration(Path(self.tmp.name))
+        orch.wave("01-build", "build", ["builder"], "succeeded")
+        (orch.folder / "herdr.json").write_text(json.dumps({"tab": "w9:t7", "pipelinePane": "w9:p2"}), encoding="utf-8")
+        tab = json.loads((orch.folder / "herdr.json").read_text())["tab"]
+        clock, out = Clock(), io.StringIO()
+        closer = watch.TabCloser(tab, 120, runner=self.fake, timer=clock)
+        self.assertEqual(watch.pipeline(orch.folder, PHASES, orchestrate.reported_total_tokens, out=out, poll=30,
+                                        sleep=clock.sleep, closer=closer), 0)
+        self.assertEqual(self.closes(), [["tab", "close", "w9:t7"]])
+        self.assertGreaterEqual(clock.now, 120)
+        self.assertIn("this tab closes in 2m00s", out.getvalue())
+        self.assertTrue((orch.folder / "01-build" / "state.json").is_file())
+
+    def test_a_new_wave_during_the_grace_period_cancels_the_close(self):
+        orch = Orchestration(Path(self.tmp.name))
+        orch.wave("01-build", "build", ["builder"], "succeeded")
+        clock = Clock()
+        closer = watch.TabCloser("w9:t7", 120, runner=self.fake, timer=clock)
+        self.assertTrue(closer.update(watch.orchestration_finished(orch.folder)).startswith("finished"))
+        clock.now = 60
+        orch.wave("02-test", "test", ["tester"])
+        self.assertEqual(closer.update(watch.orchestration_finished(orch.folder)), "")
+        clock.now = 500
+        self.assertEqual(closer.update(watch.orchestration_finished(orch.folder)), "")
+        self.assertEqual(self.closes(), [])
+
+    def test_zero_seconds_never_closes(self):
+        orch = Orchestration(Path(self.tmp.name))
+        orch.wave("01-build", "build", ["builder"], "succeeded")
+        clock = Clock()
+        closer = watch.TabCloser("w9:t7", 0, runner=self.fake, timer=clock)
+        for clock.now in (0, 1000, 100000):
+            self.assertEqual(closer.update(watch.orchestration_finished(orch.folder)), "")
+        self.assertEqual(self.closes(), [])
+        self.assertIsNone(orchestrate.watch_closer(watch, None))
+
+    def test_a_failed_close_does_not_raise(self):
+        def broken(args, **_):
+            return SimpleNamespace(returncode=1, stdout="", stderr="tab not found")
+        clock = Clock()
+        closer = watch.TabCloser("w9:t7", 10, runner=broken, timer=clock)
+        closer.update(True)
+        clock.now = 10
+        self.assertEqual(closer.update(True), "closed")
+
+    def test_a_single_wave_tab_closes_after_the_wave_ends(self):
+        opened = watch.open_herdr(self.wave.run, Path("/x/orchestrate.py"), python="py", runner=self.fake)
+        runs = [call[3] for call in self.calls if call[:2] == ["pane", "run"]]
+        self.assertTrue(runs[0].endswith("--here --close-tab " + opened["tab"]))
+        self.wave.state({"status": "succeeded", "workers": {"scout": {"status": "succeeded"}, "build": {"status": "succeeded"}}})
+        clock = Clock()
+        closer = watch.TabCloser(opened["tab"], 120, runner=self.fake, timer=clock)
+        watch.summary(self.wave.run, orchestrate.reported_total_tokens, out=io.StringIO(), poll=30,
+                      sleep=clock.sleep, closer=closer)
+        self.assertEqual(self.closes(), [["tab", "close", "w9:t2"]])
+
+    def test_watch_here_by_hand_never_closes(self):
+        orch = Orchestration(Path(self.tmp.name))
+        orch.wave("01-build", "build", ["builder"], "succeeded")
+        (orch.folder / "herdr.json").write_text(json.dumps({"tab": "w9:t7", "pipelinePane": "w9:p2"}), encoding="utf-8")
+        seen = {}
+        views = SimpleNamespace(in_herdr=lambda: True, HERDR_STATE="herdr.json",
+                                pipeline=lambda *a, **k: seen.update(k) or 0, summary=lambda *a, **k: seen.update(k) or 0)
+        with mock.patch.object(orchestrate, "watch_module", return_value=views):
+            self.assertEqual(orchestrate.main(["watch", str(orch.folder), "--here"]), 0)
+            self.assertIsNone(seen["closer"])
+            self.assertEqual(orchestrate.main(["watch", str(self.wave.run), "--here"]), 0)
+            self.assertIsNone(seen["closer"])
+
+
 class PolicyTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -326,6 +412,15 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(policy["onboarded"])
         with self.assertRaises(orchestrate.PlanError):
             orchestrate.validate_policy({"watch": "maybe"})
+
+    def test_watch_close_after_defaults_to_two_minutes_and_can_be_set(self):
+        self.assertEqual(orchestrate.load_policy(self.policy)["watchCloseAfterSeconds"], 120)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(orchestrate.main(["policy", "set", "--watch-close-after", "0", "--file", str(self.policy)]), 0)
+        self.assertEqual(orchestrate.load_policy(self.policy)["watchCloseAfterSeconds"], 0)
+        for bad in (-1, "120", True):
+            with self.assertRaises(orchestrate.PlanError):
+                orchestrate.validate_policy({"watchCloseAfterSeconds": bad})
 
     def test_auto_watch_only_opens_when_on_and_never_raises(self):
         wave = Wave(Path(self.tmp.name))

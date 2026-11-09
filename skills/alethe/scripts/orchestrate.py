@@ -171,6 +171,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "trust": {"allowUnsafe": False, "cwdRoots": [], "workerEnv": [], "maxPermissions": {}, "defaultPermissions": "standard"},
     "classifier": {"mode": "off", "model": "~typesafe/jev-latest", "endpoint": "https://openrouter.ai/api/alpha/decisions"},
     "watch": "off",
+    "watchCloseAfterSeconds": 120,
 }
 CLASSIFIER_MODES = ("off", "shadow", "on")
 # Worker permission levels, lowest first. "network" adds network and shell/web tools;
@@ -1891,6 +1892,12 @@ def validate_watch(value: Any) -> str:
     return value
 
 
+def validate_watch_close(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 86400:
+        raise PlanError("policy.watchCloseAfterSeconds must be whole seconds from 0 (never close) to 86400")
+    return value
+
+
 def validate_policy(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise PlanError("policy must be a JSON object")
@@ -1939,6 +1946,7 @@ def validate_policy(raw: Any) -> Dict[str, Any]:
         "trust": validate_trust(raw.get("trust")),
         "classifier": validate_classifier(raw.get("classifier")),
         "watch": validate_watch(raw.get("watch", "off")),
+        "watchCloseAfterSeconds": validate_watch_close(raw.get("watchCloseAfterSeconds", 120)),
     }
 
 
@@ -4151,6 +4159,17 @@ def orchestration_phases(folder: Path) -> List[Dict[str, Any]]:
         return []
     phases = ((data.get("playbooks") or {}).get(playbook) or {}).get("phases")
     return [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
+
+
+def watch_closer(views: Any, tab: Any) -> Any:
+    """The closer for a Herdr tab Alethe opened, or None when closing is off or the tab is unknown."""
+    if not isinstance(tab, str) or not tab:
+        return None
+    try:
+        after = load_policy(default_policy_path())["watchCloseAfterSeconds"]
+    except (PlanError, OSError, ValueError):
+        after = views.CLOSE_AFTER_SECONDS
+    return views.TabCloser(tab, after) if after > 0 else None
 
 
 def auto_watch(run_dir: Path, policy_path: Path) -> Optional[Dict[str, Any]]:
@@ -6552,6 +6571,8 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
         policy["classifier"] = validate_classifier(classifier)
     if args.watch:
         policy["watch"] = args.watch
+    if args.watch_close_after is not None:
+        policy["watchCloseAfterSeconds"] = validate_watch_close(args.watch_close_after)
     if args.default_permissions:
         policy["trust"] = validate_trust({**policy["trust"], "defaultPermissions": args.default_permissions})
     if args.max_permissions:
@@ -6593,7 +6614,7 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
                     raise PlanError(f"expected PROVIDER={key.upper()}, got {pair!r}")
                 tiers.setdefault(tier, {}).setdefault(provider.strip(), {})[key] = value.strip()
     policy["modelTiers"] = validate_model_tiers(tiers, "policy.modelTiers")
-    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions", "watch")
+    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions", "watch", "watch_close_after")
     classifier_only = any(getattr(args, name) for name in side_settings) and not any(
         value not in (None, False) for name, value in vars(args).items()
         if name not in ("command", "policy_action", "file", *side_settings)
@@ -6705,6 +6726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     watch_parser.add_argument("--here", action="store_true", help="show the summary table in this terminal")
     watch_parser.add_argument("--once", action="store_true", help="print the summary once and exit")
     watch_parser.add_argument("--panes", action="store_true", help=argparse.SUPPRESS)
+    watch_parser.add_argument("--close-tab", help=argparse.SUPPRESS)
     follow_parser = subparsers.add_parser("follow", help="print one worker's activity as readable lines until it ends")
     follow_parser.add_argument("run_dir", type=Path)
     follow_parser.add_argument("worker")
@@ -6788,6 +6810,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                help="permissions for writing workers that do not ask; only at the user's request")
     policy_parser.add_argument("--watch", choices=["on", "off"],
                                help="open live Herdr panes for every wave when running inside Herdr")
+    policy_parser.add_argument("--watch-close-after", type=int, metavar="SECONDS",
+                               help="close Alethe's Herdr tab this long after its work ends; 0 keeps it open")
     policy_parser.add_argument("--classifier", choices=list(CLASSIFIER_MODES),
                                help="Jev classifier: off, shadow (classify and log only) or on")
     policy_parser.add_argument("--classifier-model", help="Jev model id, such as ~typesafe/jev-latest")
@@ -6879,11 +6903,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             estimate = live_cost_estimator(getattr(args, "policy", None))
             if (folder / ORCHESTRATION_FILE).is_file():
                 if args.here or args.once or not views.in_herdr():
-                    panes = None
+                    panes = closer = None
                     if args.panes and views.in_herdr() and os.environ.get("HERDR_PANE_ID"):
                         panes = views.WavePanes(os.environ["HERDR_PANE_ID"], views.launcher(sys.executable, Path(__file__).resolve()))
+                        tab = (read_optional_json(folder / views.HERDR_STATE) or {}).get("tab") or os.environ.get("HERDR_TAB_ID")
+                        closer = watch_closer(views, tab)
                     return views.pipeline(folder, orchestration_phases(folder), reported_total_tokens, once=args.once,
-                                          estimate=estimate, panes=panes)
+                                          estimate=estimate, panes=panes, closer=closer)
                 try:
                     print(json.dumps({"folder": str(folder), **views.open_orchestration(folder, Path(__file__).resolve())}, indent=2))
                 except RuntimeError as error:
@@ -6891,7 +6917,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 0
             run_dir = watch_target(args.target)
             if args.here or args.once or not views.in_herdr():
-                return views.summary(run_dir, reported_total_tokens, once=args.once, estimate=estimate)
+                closer = watch_closer(views, args.close_tab) if args.close_tab and views.in_herdr() else None
+                return views.summary(run_dir, reported_total_tokens, once=args.once, estimate=estimate, closer=closer)
             try:
                 print(json.dumps({"runDir": str(run_dir), **views.open_herdr(run_dir, Path(__file__).resolve())}, indent=2))
             except RuntimeError as error:

@@ -26,6 +26,10 @@ Added:
   a pipeline pane that lists every playbook phase as done, running, next or skipped (with the
   reason from `note`), its workers, time, tokens and cost, beside live feeds for the current wave's
   workers, which change as waves start. Outside Herdr, `watch --here` prints the same pipeline.
+- The Herdr tab Alethe opens closes itself `watchCloseAfterSeconds` (default 120) after its
+  orchestration or wave ends, so the tab list shows only work in progress. A wave that starts during
+  the wait cancels it, a later wave opens a new tab, and results stay in the folder.
+  `policy set --watch-close-after 0` keeps tabs open; `watch --here` run by hand never closes.
 - `watch` shows tokens and cost while a worker runs, read from its stream (Claude counts each
   message once) and marked `~`; the cost is a list-price estimate until the CLI reports its own.
 - The `complete` playbook gains a `test` phase between `build` and `review`: for a unit tagged

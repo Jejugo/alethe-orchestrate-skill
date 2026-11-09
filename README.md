@@ -115,7 +115,7 @@ Type them after `/alethe`.
 | `spend` | Shows lead and delegated Claude session tokens and list-price estimates |
 | `freestyle` | Works as usual, only watches cost and suggests cheaper models |
 | `status` | Where it stands |
-| `watch` | Opens one Herdr tab per orchestration: every phase with its state and cost, beside live panes for the current wave's workers; a table elsewhere. `watch on` opens it by itself |
+| `watch` | Opens one Herdr tab per orchestration: every phase with its state and cost, beside live panes for the current wave's workers; a table elsewhere. `watch on` opens it by itself, and it closes two minutes after the work ends |
 | `stop` | Stops the workers |
 | `clean` | Previews old completed folders; add `--yes` to delete |
 | `report` | What each worker did and cost |
