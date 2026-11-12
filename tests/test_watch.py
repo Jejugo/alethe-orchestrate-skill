@@ -98,7 +98,7 @@ class FollowAndSummaryTests(unittest.TestCase):
                      wave.state({"status": "running", "workers": {"scout": {"status": "succeeded", "durationSeconds": 3}}})),
         ])
         out, reporter = io.StringIO(), SilentReporter()
-        code = watch.follow(wave.run, "scout", out=out, reporter=reporter, sleep=lambda _: next(steps)())
+        code = watch.follow(wave.run, "scout", out=out, reporter=reporter, sleep=lambda _: next(steps)(), feed="all")
         text = out.getvalue()
         self.assertEqual(code, 0)
         self.assertIn("== scout · codex · mini", text)
@@ -108,6 +108,58 @@ class FollowAndSummaryTests(unittest.TestCase):
         self.assertIn("SUMMARY: ok", text)
         self.assertEqual(reporter.calls[0][0], "working")
         self.assertEqual(reporter.calls[-1], ("idle", "scout: succeeded"))
+
+    def test_the_default_feed_shows_only_what_the_agent_says(self):
+        wave, now = self.wave, [0.0]
+        wave.log("scout",
+                 {"type": "item.started", "item": {"type": "command_execution", "command": "/bin/zsh -lc 'cd src && rg x'"}},
+                 {"type": "item.completed", "item": {"type": "agent_message", "text": "Achados consolidados; registrando."}},
+                 {"type": "item.started", "item": {"type": "command_execution", "command": "cd src && ls"}},
+                 {"type": "item.completed", "item": {"type": "file_change", "changes": [{"path": "a.py", "kind": "update"}]}})
+
+        def step(_):
+            now[0] += 61
+            if now[0] > 100:
+                wave.state({"status": "running", "workers": {"scout": {"status": "succeeded", "durationSeconds": 3}}})
+
+        out = io.StringIO()
+        watch.follow(wave.run, "scout", out=out, reporter=SilentReporter(), sleep=step, timer=lambda: now[0])
+        text = out.getvalue()
+        self.assertIn("› Achados consolidados; registrando.", text)
+        self.assertNotIn("cd src", text)
+        self.assertNotIn("✎", text)
+        self.assertIn("… working, 2 steps since the last message", text)
+        self.assertEqual(watch.event_lines("claude", {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Reading."}, {"type": "tool_use", "name": "Bash", "input": {"command": "cd x"}}]}},
+            actions=False), ["› Reading."])
+
+    def test_in_a_terminal_actions_pass_on_one_line_and_messages_stay(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        wave = self.wave
+        wave.log("scout",
+                 {"type": "item.started", "item": {"type": "command_execution", "command": "/bin/zsh -lc 'cd /repo && rg x src'"}},
+                 {"type": "item.started", "item": {"type": "command_execution", "command": "ls"}},
+                 {"type": "item.completed", "item": {"type": "agent_message", "text": "Achados consolidados."}})
+        wave.state({"status": "running", "workers": {"scout": {"status": "succeeded", "durationSeconds": 3}}})
+        out = Terminal()
+        watch.follow(wave.run, "scout", out=out, reporter=SilentReporter(), sleep=lambda _: None)
+        text = out.getvalue()
+        self.assertIn("\r\x1b[2K\x1b[2m", text)
+        self.assertIn("⋯ $ rg x src\x1b[0m\r\x1b[2K", text)
+        permanent = text.split("\r\x1b[2K")[-1]
+        self.assertIn("› Achados consolidados.\n", permanent)
+        self.assertNotIn("rg x", permanent)
+        self.assertNotIn("cd /repo", text)
+        self.assertNotIn("working,", text)
+
+    def test_shell_wrappers_and_leading_cd_are_dropped(self):
+        self.assertEqual(watch.readable_command("/bin/zsh -lc 'cd /a/b && rg x'"), "rg x")
+        self.assertEqual(watch.readable_command('bash -lc "cd \'/a b\' && npm test"'), "npm test")
+        self.assertEqual(watch.readable_command("cd src"), "cd src")
+        self.assertEqual(watch.readable_command("git status"), "git status")
 
     def test_follow_stops_when_the_runner_is_gone(self):
         self.wave.state({"status": "failed", "workers": {"build": {"status": "queued"}}})
@@ -412,6 +464,14 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(policy["onboarded"])
         with self.assertRaises(orchestrate.PlanError):
             orchestrate.validate_policy({"watch": "maybe"})
+
+    def test_watch_feed_defaults_to_messages_and_can_show_everything(self):
+        self.assertEqual(orchestrate.load_policy(self.policy)["watchFeed"], "messages")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(orchestrate.main(["policy", "set", "--watch-feed", "all", "--file", str(self.policy)]), 0)
+        self.assertEqual(orchestrate.load_policy(self.policy)["watchFeed"], "all")
+        with self.assertRaises(orchestrate.PlanError):
+            orchestrate.validate_policy({"watchFeed": "verbose"})
 
     def test_watch_close_after_defaults_to_two_minutes_and_can_be_set(self):
         self.assertEqual(orchestrate.load_policy(self.policy)["watchCloseAfterSeconds"], 120)

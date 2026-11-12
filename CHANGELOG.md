@@ -30,6 +30,10 @@ Added:
   orchestration or wave ends, so the tab list shows only work in progress. A wave that starts during
   the wait cancels it, a later wave opens a new tab, and results stay in the folder.
   `policy set --watch-close-after 0` keeps tabs open; `watch --here` run by hand never closes.
+- Worker feeds (`follow`) keep only what the agent says by default. In a terminal the current
+  command, tool call or edit passes on one dim status line that the next one replaces and a message
+  erases; elsewhere a quiet minute prints how many it ran. Commands read without their shell wrapper
+  and leading `cd`. `policy set --watch-feed all` or `follow --all` keeps every line.
 - `watch` shows tokens and cost while a worker runs, read from its stream (Claude counts each
   message once) and marked `~`; the cost is a list-price estimate until the CLI reports its own.
 - The `complete` playbook gains a `test` phase between `build` and `review`: for a unit tagged

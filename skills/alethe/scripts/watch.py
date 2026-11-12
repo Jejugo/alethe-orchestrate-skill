@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -50,17 +51,36 @@ def duration(seconds: Optional[float]) -> str:
 
 # ---- one readable line per CLI event -------------------------------------------------------
 
+FEEDS = ("messages", "all")
+
+
+class Action(str):
+    """A command, tool call or edit line; the default `messages` feed shows it only on a passing status line."""
+
+
+SHELL_WRAPPER = re.compile(r"^(?:\S*/)?(?:ba|z)?sh\s+-l?c\s+(['\"])(.*)\1$", re.S)
+LEADING_CD = re.compile(r"^cd\s+(?:\"[^\"]*\"|'[^']*'|\S+)\s*&&\s*")
+
+
+def readable_command(command: Any) -> str:
+    """`/bin/zsh -lc 'cd /repo && rg x'` reads as `rg x`: the shell wrapper and the leading cd say nothing."""
+    text = str(command or "").strip()
+    match = SHELL_WRAPPER.match(text)
+    if match:
+        text = match.group(2).strip()
+    return LEADING_CD.sub("", text) or text
+
 def codex_lines(event: Dict[str, Any]) -> List[str]:
     kind = event.get("type")
     item = event.get("item") if isinstance(event.get("item"), dict) else {}
     item_type = item.get("type")
     if kind == "item.started":
         if item_type == "command_execution":
-            return [f"$ {short(item.get('command', ''))}"]
+            return [Action(f"$ {short(readable_command(item.get('command')))}")]
         if item_type == "web_search":
-            return [f"search {short(item.get('query', ''))}"]
+            return [Action(f"search {short(item.get('query', ''))}")]
         if item_type == "mcp_tool_call":
-            return [f"tool {item.get('server', '?')}.{item.get('tool', '?')}"]
+            return [Action(f"tool {item.get('server', '?')}.{item.get('tool', '?')}")]
         return []
     if kind == "item.completed":
         if item_type == "agent_message":
@@ -69,10 +89,10 @@ def codex_lines(event: Dict[str, Any]) -> List[str]:
             return [f"· {short(item.get('text', ''), 200)}"]
         if item_type == "command_execution":
             code = item.get("exit_code")
-            return [f"  ↳ exit {code}"] if code not in (None, 0) else []
+            return [Action(f"  ↳ exit {code}")] if code not in (None, 0) else []
         if item_type == "file_change":
             changes = item.get("changes") if isinstance(item.get("changes"), list) else []
-            return [f"✎ {change.get('kind', 'edit')} {change.get('path', '?')}" for change in changes if isinstance(change, dict)]
+            return [Action(f"✎ {change.get('kind', 'edit')} {change.get('path', '?')}") for change in changes if isinstance(change, dict)]
         if item_type == "todo_list":
             items = item.get("items") if isinstance(item.get("items"), list) else []
             return [f"☐ {short(entry.get('text', ''), 120)}" for entry in items if isinstance(entry, dict)]
@@ -105,11 +125,11 @@ def claude_lines(event: Dict[str, Any]) -> List[str]:
                 name = block.get("name", "tool")
                 arguments = block.get("input") if isinstance(block.get("input"), dict) else {}
                 detail = next((arguments[key] for key in CLAUDE_INPUT_KEYS if arguments.get(key)), "")
-                lines.append(f"$ {short(arguments['command'])}" if name == "Bash" and arguments.get("command")
-                             else f"{name} {short(detail, 200)}".rstrip())
+                lines.append(Action(f"$ {short(readable_command(arguments['command']))}" if name == "Bash" and arguments.get("command")
+                                    else f"{name} {short(detail, 200)}".rstrip()))
         return lines
     if kind == "user":
-        return [f"  ↳ error: {short(block.get('content', ''), 200)}" for block in content
+        return [Action(f"  ↳ error: {short(block.get('content', ''), 200)}") for block in content
                 if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("is_error")]
     if kind == "result":
         cost = event.get("total_cost_usd")
@@ -123,21 +143,24 @@ def generic_lines(event: Dict[str, Any]) -> List[str]:
     for call in event.get("tool_calls") or []:
         if isinstance(call, dict):
             function = call.get("function") if isinstance(call.get("function"), dict) else call
-            lines.append(f"tool {function.get('name', '?')}")
+            lines.append(Action(f"tool {function.get('name', '?')}"))
     text = event.get("content") if isinstance(event.get("content"), str) else event.get("text")
     if isinstance(text, str) and text.strip() and role in ("assistant", "message", "text", "output"):
         lines.append(f"› {short(text)}")
     return lines
 
 
-def event_lines(provider: str, event: Any) -> List[str]:
+def event_lines(provider: str, event: Any, actions: bool = True) -> List[str]:
+    """Readable lines for one event; `actions=False` keeps only what the agent says, not the commands it runs."""
     if not isinstance(event, dict):
         return []
     if provider == "codex":
-        return codex_lines(event)
-    if provider == "claude":
-        return claude_lines(event)
-    return generic_lines(event)
+        lines = codex_lines(event)
+    elif provider == "claude":
+        lines = claude_lines(event)
+    else:
+        lines = generic_lines(event)
+    return lines if actions else [line for line in lines if not isinstance(line, Action)]
 
 
 # ---- follow one worker -----------------------------------------------------------------------
@@ -191,9 +214,42 @@ class HerdrReporter:
             pass
 
 
+class StatusLine:
+    """One passing line at the bottom of a terminal: each action replaces the last, and a message erases it."""
+
+    def __init__(self, out: Any) -> None:
+        self.out = out
+        self.live = hasattr(out, "isatty") and out.isatty()
+        self.shown = False
+
+    def show(self, text: str) -> None:
+        if not self.live:
+            return
+        width = shutil.get_terminal_size((100, 40)).columns
+        text = text if len(text) < width else text[: width - 2] + "…"
+        self.out.write("\r\x1b[2K\x1b[2m" + text + "\x1b[0m")
+        self.out.flush()
+        self.shown = True
+
+    def clear(self) -> None:
+        if self.shown:
+            self.out.write("\r\x1b[2K")
+            self.shown = False
+
+
 def follow(run_dir: Path, worker_id: str, out: Any = None, poll: float = POLL_SECONDS,
-           reporter: Optional[HerdrReporter] = None, sleep: Callable[[float], None] = time.sleep) -> int:
+           reporter: Optional[HerdrReporter] = None, sleep: Callable[[float], None] = time.sleep,
+           feed: str = "messages", timer: Callable[[], float] = time.monotonic) -> int:
+    """Print one worker's activity. The `messages` feed keeps what the agent says; in a terminal the
+    current command or tool call passes on one status line that the next one replaces, and elsewhere a
+    quiet minute prints how many it ran. `all` keeps every command, tool call and edit."""
     out = out or sys.stdout
+    actions = feed == "all"
+    passing = StatusLine(out)
+
+    def say(text: str) -> None:
+        passing.clear()
+        print(text, file=out)
     entry = worker_entry(run_dir, worker_id)
     provider = entry.get("provider") or ""
     label = worker_label(entry)
@@ -202,7 +258,8 @@ def follow(run_dir: Path, worker_id: str, out: Any = None, poll: float = POLL_SE
     print(f"== {label}", file=out)
     if entry.get("why"):
         print(f"   {short(entry['why'], 200)}", file=out)
-    offset, buffer, announced, last_note = 0, "", False, time.monotonic()
+    offset, buffer, announced, last_note = 0, "", False, timer()
+    hidden, last_line = 0, timer()
     while True:
         state = worker_state(run_dir, worker_id)
         status = state.get("status") or "queued"
@@ -219,18 +276,27 @@ def follow(run_dir: Path, worker_id: str, out: Any = None, poll: float = POLL_SE
                 except ValueError:
                     continue
                 for line in event_lines(provider, event):
-                    print(f"{clock()} {line}", file=out)
+                    if isinstance(line, Action) and not actions:
+                        hidden += 1
+                        passing.show(f"{clock()} ⋯ {line.strip()}")
+                        continue
+                    say(f"{clock()} {line}")
+                    hidden, last_line = 0, timer()
         if status == "running":
             reporter.report("working", f"{entry.get('id')}: running")
             if provider == "agy" and not announced:
-                print(f"{clock()} agy writes its output only when it finishes; waiting", file=out)
+                say(f"{clock()} agy writes its output only when it finishes; waiting")
                 announced = True
-            if time.monotonic() - last_note >= 60 and provider in ("agy", "kimi"):
-                print(f"{clock()} still running", file=out)
-                last_note = time.monotonic()
+            if timer() - last_note >= 60 and provider in ("agy", "kimi"):
+                say(f"{clock()} still running")
+                last_note = timer()
+            if hidden and not passing.live and timer() - last_line >= 60:
+                say(f"{clock()} … working, {hidden} step{'s' if hidden != 1 else ''} since the last message")
+                hidden, last_line = 0, timer()
         elif status == "queued":
             reporter.report("idle", f"{entry.get('id')}: queued")
         if status in FINAL or (status != "running" and state.get("runStatus") not in (None, "running")):
+            passing.clear()
             finish(run_dir, worker_id, state, out)
             reporter.report("idle", f"{entry.get('id')}: {status}")
             out.flush()

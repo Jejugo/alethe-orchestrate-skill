@@ -172,6 +172,7 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "classifier": {"mode": "off", "model": "~typesafe/jev-latest", "endpoint": "https://openrouter.ai/api/alpha/decisions"},
     "watch": "off",
     "watchCloseAfterSeconds": 120,
+    "watchFeed": "messages",
 }
 CLASSIFIER_MODES = ("off", "shadow", "on")
 # Worker permission levels, lowest first. "network" adds network and shell/web tools;
@@ -1898,6 +1899,12 @@ def validate_watch_close(value: Any) -> int:
     return value
 
 
+def validate_watch_feed(value: Any) -> str:
+    if value not in ("messages", "all"):
+        raise PlanError("policy.watchFeed must be messages or all")
+    return value
+
+
 def validate_policy(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise PlanError("policy must be a JSON object")
@@ -1947,6 +1954,7 @@ def validate_policy(raw: Any) -> Dict[str, Any]:
         "classifier": validate_classifier(raw.get("classifier")),
         "watch": validate_watch(raw.get("watch", "off")),
         "watchCloseAfterSeconds": validate_watch_close(raw.get("watchCloseAfterSeconds", 120)),
+        "watchFeed": validate_watch_feed(raw.get("watchFeed", "messages")),
     }
 
 
@@ -4159,6 +4167,13 @@ def orchestration_phases(folder: Path) -> List[Dict[str, Any]]:
         return []
     phases = ((data.get("playbooks") or {}).get(playbook) or {}).get("phases")
     return [phase for phase in phases if isinstance(phase, dict)] if isinstance(phases, list) else []
+
+
+def watch_feed() -> str:
+    try:
+        return load_policy(default_policy_path())["watchFeed"]
+    except (PlanError, OSError, ValueError):
+        return "messages"
 
 
 def watch_closer(views: Any, tab: Any) -> Any:
@@ -6573,6 +6588,8 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
         policy["watch"] = args.watch
     if args.watch_close_after is not None:
         policy["watchCloseAfterSeconds"] = validate_watch_close(args.watch_close_after)
+    if args.watch_feed:
+        policy["watchFeed"] = args.watch_feed
     if args.default_permissions:
         policy["trust"] = validate_trust({**policy["trust"], "defaultPermissions": args.default_permissions})
     if args.max_permissions:
@@ -6614,7 +6631,7 @@ def update_policy(args: argparse.Namespace, policy_path: Path) -> Dict[str, Any]
                     raise PlanError(f"expected PROVIDER={key.upper()}, got {pair!r}")
                 tiers.setdefault(tier, {}).setdefault(provider.strip(), {})[key] = value.strip()
     policy["modelTiers"] = validate_model_tiers(tiers, "policy.modelTiers")
-    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions", "watch", "watch_close_after")
+    side_settings = ("classifier", "classifier_model", "max_permissions", "default_permissions", "watch", "watch_close_after", "watch_feed")
     classifier_only = any(getattr(args, name) for name in side_settings) and not any(
         value not in (None, False) for name, value in vars(args).items()
         if name not in ("command", "policy_action", "file", *side_settings)
@@ -6730,6 +6747,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     follow_parser = subparsers.add_parser("follow", help="print one worker's activity as readable lines until it ends")
     follow_parser.add_argument("run_dir", type=Path)
     follow_parser.add_argument("worker")
+    follow_parser.add_argument("--all", action="store_true", help="also show every command, tool call and edit")
     wait_parser = subparsers.add_parser("wait", help="wait for running waves to finish")
     wait_parser.add_argument("folder", nargs="?", type=Path)
     wait_parser.add_argument("--timeout", type=int, default=DEFAULT_WAIT_SECONDS)
@@ -6812,6 +6830,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                help="open live Herdr panes for every wave when running inside Herdr")
     policy_parser.add_argument("--watch-close-after", type=int, metavar="SECONDS",
                                help="close Alethe's Herdr tab this long after its work ends; 0 keeps it open")
+    policy_parser.add_argument("--watch-feed", choices=["messages", "all"],
+                               help="worker feeds show only what the agent says (messages) or every command too (all)")
     policy_parser.add_argument("--classifier", choices=list(CLASSIFIER_MODES),
                                help="Jev classifier: off, shadow (classify and log only) or on")
     policy_parser.add_argument("--classifier-model", help="Jev model id, such as ~typesafe/jev-latest")
@@ -6929,7 +6949,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not (run_dir / "plan.json").is_file() or not ID_PATTERN.fullmatch(args.worker):
                 raise PlanError("follow needs a wave folder with plan.json and a worker id")
             try:
-                return watch_module().follow(run_dir, args.worker)
+                feed = "all" if args.all else watch_feed()
+                return watch_module().follow(run_dir, args.worker, feed=feed)
             except KeyboardInterrupt:
                 return 130
         if args.command == "new":
