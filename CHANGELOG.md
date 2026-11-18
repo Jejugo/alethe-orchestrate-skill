@@ -5,8 +5,22 @@ Alethe installs and updates the skill by that number.
 
 ## Unreleased
 
+Changed:
+
+- `/alethe on` now orchestrates. The reminder makes the lead decide on each request whether the work
+  splits into bounded units and say why when it keeps the work. A project `mode on` approves starting
+  without waiting for an ok, except for API-billed or unknown-billing providers, low quota, or a run
+  past the budget. `/alethe always` still waits for an ok.
+
 Added:
 
+- `hook --install` adds the reminder hook to Claude Code's settings for skills installed by hand.
+  `doctor` and `mode on` warn when it is missing.
+- `steer <worker> "<instruction>"` changes a running worker's course: it stops only that worker,
+  then resumes its own session, in its own worktree, with the same model and permissions and the
+  instruction as the new task, as the next wave of the same phase. `stop --worker <id>` stops one
+  worker and leaves the rest of its wave running. A `full` worker may resume only inside the
+  worktree the runner made for it.
 - Optional Jev classifier (`classify`) over OpenRouter's decisions API judges each unit's
   `kind`, `narrow`, `risky` and effort class, leaving uncertain answers to the lead. Off by
   default; `policy set --classifier shadow|on` turns it on, the key lives in `jev.key` next to the

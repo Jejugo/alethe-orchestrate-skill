@@ -42,7 +42,8 @@ codex plugin add alethe-orchestrate@alethe
 ```
 
 Or copy `skills/alethe` into `~/.claude/skills/`, `~/.codex/skills/` or
-`~/.agents/skills/`.
+`~/.agents/skills/`. In Claude Code, a copied skill has no hook, so run
+`scripts/orchestrate.py hook --install` once to keep `/alethe on` active across prompts.
 
 </details>
 
@@ -115,6 +116,7 @@ Type them after `/alethe`.
 | `spend` | Shows lead and delegated Claude session tokens and list-price estimates |
 | `freestyle` | Works as usual, only watches cost and suggests cheaper models |
 | `status` | Where it stands |
+| `steer <worker> <instruction>` | Changes a running worker's course: stops only that worker and resumes its own session, in its own worktree, with your instruction |
 | `watch` | Opens one Herdr tab per orchestration: every phase with its state and cost, beside live panes for the current wave's workers; a table elsewhere. `watch on` opens it by itself, and it closes two minutes after the work ends. Worker feeds show what each agent says, not its commands (`policy set --watch-feed all` for both) |
 | `stop` | Stops the workers |
 | `clean` | Previews old completed folders; add `--yes` to delete |

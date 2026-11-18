@@ -61,7 +61,9 @@ down to `network` with a `dry-run` warning; an explicit `full` there is refused.
 Codex workers also run with `--no-daemon` when the CLI offers it, so each one runs on its own
 instead of through the user's shared background server.
 
-`full` always runs in the worker's own worktree, needs a git checkout, and cannot resume a session.
+`full` always runs in the worker's own worktree and needs a git checkout. It cannot resume a session,
+except inside the worktree the runner made for that worker (`.alethe/worktrees/skill-*`, registered
+with git), which is what `steer` does.
 A CLI without the needed flag refuses the worker rather than running it lower. At every level the
 runner still removes unrelated secrets from the environment, blocks subagents and MCP servers, and
 `report` shows the level next to the mode. Read-only workers stay read-only; Kimi always approves

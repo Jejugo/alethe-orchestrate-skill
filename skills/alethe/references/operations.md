@@ -161,13 +161,17 @@ fall back to `balanced`/`normal`; invalid project `seenAt` values expire that ov
 
 `hook` reads an agent hook's JSON from stdin and prints a one-paragraph reminder of the goal, care
 level and rules when the hook's `cwd` is inside a project with a mode on, and nothing otherwise.
-It never fails. The Claude Code plugin runs it on every prompt (`hooks/hooks.json`). Under goal
+It never fails. The Claude Code plugin runs it on every prompt (`hooks/hooks.json`). A skill copied
+by hand has no hook: `doctor` and `mode on` warn about it, and `hook --install` adds it to the user's
+Claude Code `settings.json`, once. The reminder asks the lead to decide on each request whether the
+work splits into bounded units. A project `mode on` approves starting those orchestrations without
+waiting; `mode on --everywhere` still waits for an ok. Under goal
 `freestyle` the reminder asks for no orchestration at all: the lead works as usual, watches quota,
 and offers one-line suggestions for cheaper routes.
 
 ## Changing course
 
-`note "<text>" [--kind change|skip|add|switch|lead]` appends a line to `journal.jsonl` in the
+`note "<text>" [--kind change|skip|add|switch|lead|steer]` appends a line to `journal.jsonl` in the
 orchestration folder. The report lists them under "Changes to the plan" with the time, and
 `status` shows the count and the latest one. Record a skipped or added phase, a switched playbook,
 a move to freeform waves, or a step the lead did itself, with the reason.
@@ -176,6 +180,21 @@ a move to freeform waves, or a step the lead did itself, with the reason.
 process tree ends within a few seconds with status `stopped`, workers still queued are skipped
 with `failureKind: stopped`, and the wave ends as `stopped`. It also kills leftover worker
 processes after a runner was interrupted. Results that finished before stay.
+
+`stop --worker <id>` writes `workers/<id>/stop` instead: only that worker ends (or is skipped if it
+has not started), and the rest of its wave keeps running.
+
+`steer <worker> "<instruction>" [--in FOLDER] [--wait SECONDS]` changes a worker's course. It finds
+the latest wave with that worker, writes `steer.json` and the worker's `stop` file, and waits up to
+`--wait` seconds (default 120) for it to settle as `stopped` with `failureKind: steered`. Then it
+writes `steer-<worker>-<time>.json` in the orchestration folder and starts it as the next wave of
+the same phase: one `rescue` worker with the same id, provider, model, effort, mode, permissions and
+timeout, `resume` set to the stopped session and `cwd` set to the directory it ran in (its own
+worktree when it was isolated). Its task is the instruction, which wins over the earlier brief
+where they conflict. A worker that already finished is resumed the same way, as a follow-up. The
+command prints the stopped wave, the session and the new wave's start, like `run --detach`, and
+records a `steer` note. It refuses Kimi and custom workers, which cannot resume, and a worker that
+ended before its CLI reported a session.
 
 If Python is unavailable, do not install it without permission. Use the command shapes in
 `references/providers.md` with the host's native background-process facility and reproduce the

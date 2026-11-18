@@ -227,6 +227,7 @@ needs only what you know; use `null` for anything its CLI did not report:
 | `models` | show the model and price view above; refresh needed stale or missing entries |
 | `list`, `use <folder>` | list the run folders under the temp folder, newest first; remember the one picked |
 | `stop` | stop the background worker processes of the current folder, verifying process identity first |
+| `steer <worker> <instruction>` | stop that worker's process only, verifying its identity, then start its CLI again resuming the same session (`codex exec resume <id>`, `claude --resume <id>`) in the same directory, with the same model and permissions, and the instruction as the prompt; note it in `state.md` |
 | `clean` | with Python, preview old completed folders; `--yes` deletes eligible ones; otherwise inspect and remove them manually |
 | `budget <limit>` | write the limit at the top of `state.md` and check it after every wave |
 | `note <text>`, `mark <worker> <mark>` | append it to `state.md`; the report lists notes under "Changes to the plan" |

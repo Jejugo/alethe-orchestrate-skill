@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import signal
 import subprocess
 import sys
@@ -41,7 +42,11 @@ ORCHESTRATION_FILE = "orchestration.json"
 JOURNAL_FILE = "journal.jsonl"
 CURRENT_FILE = "current.json"
 STOP_FILE = "stop"
-NOTE_KINDS = {"change": "Changed", "skip": "Skipped", "add": "Added", "switch": "Switched", "lead": "Lead did"}
+NOTE_KINDS = {"change": "Changed", "skip": "Skipped", "add": "Added", "switch": "Switched", "lead": "Lead did",
+              "steer": "Steered"}
+STEER_FILE = "steer.json"
+STEER_WAIT_SECONDS = 120
+STEER_MESSAGE_LIMIT = 4000
 MODES_FILE = "modes.json"
 MODE_IDLE_SECONDS = 12 * 3600
 MODE_REFRESH_SECONDS = 600
@@ -50,11 +55,19 @@ MAX_MODE_RULES = 8
 MODE_GOALS = {
     "passive": "watch the session's own spend and quota, and hand bounded units to cheaper workers, Codex first while its subscription has room, without a playbook",
     "save": "spend as little as possible: keep small work with the lead and send bounded units to the cheapest capable tier",
-    "balanced": "delegate only when the playbook says it pays, on the tier each unit needs",
+    "balanced": "orchestrate work that splits into bounded units, on the tier each unit needs",
     "max": "get the most out of the available agents: parallel waves, strong reviewers and best-of-n on hard calls",
     "freestyle": "watch over cost and quota and suggest cheaper routes, without orchestrating",
 }
 PASSIVE_DEFAULTS = {"checkEveryMinutes": 15, "spendStepUsd": 5, "prefer": ["codex", "claude"], "askAboveWorkers": 2}
+MODE_GO_AHEAD = (
+    "The user turned this on, which approves orchestrating: show the playbook, workers and estimate in a few lines "
+    "and start without waiting for an ok. Ask first only for an API-billed or unknown-billing provider, a low "
+    "provider, or a run past the budget or quota.stopAt."
+)
+MODE_ASK_FIRST = (
+    "Before a multi-worker orchestration, show a few lines of dry-run and wait for the user's ok."
+)
 MODE_FREESTYLE = (
     "Work as usual, with no playbook, plan or waves. Check quota before long or heavy steps. When a "
     "cheaper or better route exists, say so in one line, at most once per reply and not again after the user "
@@ -235,6 +248,7 @@ FAILURE_HINTS = {
     "stalled": "it went quiet for too long; resume its session or narrow the task",
     "timed_out": "it ran out of time; resume its session or narrow the task",
     "stopped": "it was stopped on request; resume its session or drop the unit",
+    "steered": "the user changed course; its session continues in a later wave with their instruction",
     "budget": "a budget stopped it; raise the budget or drop the unit",
     "budget_exceeded": "its own cost cap stopped it; raise maxReportedCostUsd or narrow the task",
     "invalid_output": "its output did not parse; check stderr.log and the CLI version",
@@ -2389,6 +2403,10 @@ def resolve_permissions(item: Dict[str, Any], worker: Dict[str, Any], policy: Di
                         f"{provider} sets its own flags")
     granted = lower_permission(requested, permission_ceiling(policy, provider))
     source = "plan" if explicit else "default"
+    # A session resumed inside the worktree the runner made for it (as `steer` does) stays isolated.
+    in_own_worktree = bool(worker["resume"]) and granted == "full" and alethe_worktree(Path(worker["cwd"]))
+    if in_own_worktree:
+        return {"permissions": "full", "requestedPermissions": requested, "permissionsSource": source}
     if granted == "full" and not explicit:
         blocker = ("isolate: false" if item.get("isolate") is False else "a resumed session" if worker["resume"]
                    else "no git checkout" if not in_git_worktree(Path(worker["cwd"])) else None)
@@ -2404,6 +2422,19 @@ def resolve_permissions(item: Dict[str, Any], worker: Dict[str, Any], policy: Di
             raise PlanError(f"worker {worker_id}: full permissions need a git checkout to isolate the worker in")
         return {"permissions": "full", "requestedPermissions": requested, "permissionsSource": source, "isolate": True}
     return {"permissions": granted, "requestedPermissions": requested, "permissionsSource": source}
+
+
+def alethe_worktree(path: Path) -> bool:
+    """True for a worktree the runner made for a worker: `<checkout>/.alethe/worktrees/skill-*`, registered with git."""
+    path = path.resolve()
+    if not (path.name.startswith("skill-") and path.parent.name == "worktrees" and path.parent.parent.name == ".alethe"):
+        return False
+    try:
+        listing = run_git(path.parent.parent.parent, ["worktree", "list", "--porcelain"]).decode("utf-8", errors="replace")
+    except (PlanError, OSError, subprocess.SubprocessError):
+        return False
+    registered = {Path(line[len("worktree "):]).resolve() for line in listing.splitlines() if line.startswith("worktree ")}
+    return path in registered
 
 
 def unsafe_argument(args: Sequence[str]) -> Optional[str]:
@@ -3207,6 +3238,7 @@ def watch_process(
     last_size = 0
     last_change = last_refresh = started
     stop_path = state.path.parent / STOP_FILE
+    worker_stop = state.path.parent / "workers" / worker_id / STOP_FILE  # written by `stop --worker` and `steer`
     while True:
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
@@ -3214,10 +3246,10 @@ def watch_process(
             return exit_code_of(process), "timed_out"
         try:
             code = process.wait(timeout=min(POLL_SECONDS, remaining))
-            return code, "stopped" if stop_path.exists() else None
+            return code, "stopped" if stop_path.exists() or worker_stop.exists() else None
         except subprocess.TimeoutExpired:
             pass
-        if stop_path.exists():
+        if stop_path.exists() or worker_stop.exists():
             stop_process_tree(process)
             return exit_code_of(process), "stopped"
         now = time.monotonic()
@@ -3848,7 +3880,7 @@ def run_worker(
         state.update_worker(worker_id, outcome)
         return outcome
 
-    if (run_dir / STOP_FILE).exists():
+    if (run_dir / STOP_FILE).exists() or (worker_dir / STOP_FILE).exists():
         tracker.finish(worker_id, {})
         return settle(status="skipped", error="stopped on request", failureKind="stopped")
     if not state.value.get("allowLowQuota"):
@@ -3897,7 +3929,7 @@ def run_worker(
         )
         with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             stdin_mode = subprocess.PIPE if stdin_prompt else subprocess.DEVNULL
-            if (run_dir / STOP_FILE).exists():
+            if (run_dir / STOP_FILE).exists() or (worker_dir / STOP_FILE).exists():
                 if root is not None:
                     checkouts.leave(root, worker_id)
                 tracker.finish(worker_id, {})
@@ -3930,6 +3962,8 @@ def run_worker(
         kind, reset_hint = classify_failure(status, error, stderr_path, result_text, ended == "stalled")
         if ended == "stopped":
             status, error, kind, reset_hint = "stopped", "stopped on request", "stopped", None
+            if (worker_dir / STEER_FILE).is_file():
+                error, kind = "stopped to change course", "steered"
         diff_path, diff_error = (
             capture_diff(cwd, worker_dir, worker["isolate"]) if worker["mode"] == "write" else (None, None)
         )
@@ -4278,6 +4312,105 @@ def read_journal(folder: Optional[Path]) -> List[Dict[str, Any]]:
         if isinstance(entry, dict) and entry.get("kind") in NOTE_KINDS and isinstance(entry.get("text"), str):
             entries.append(entry)
     return entries
+
+
+def worker_wave(folder: Path, worker_id: str) -> Path:
+    """The latest wave of the orchestration that has this worker."""
+    for run_dir in reversed(wave_dirs(folder)):
+        state = read_optional_json(run_dir / "state.json")
+        if isinstance(state, dict) and isinstance(state.get("workers"), dict) and worker_id in state["workers"]:
+            return run_dir
+    raise PlanError(f"no wave in {folder} has a worker {worker_id}")
+
+
+def stop_worker(folder: Path, worker_id: str, steer: Optional[str] = None) -> Dict[str, Any]:
+    """Stop one worker of a running wave and leave the others running."""
+    run_dir = worker_wave(folder, worker_id)
+    state = read_optional_json(run_dir / "state.json") or {}
+    entry = state["workers"][worker_id] if isinstance(state["workers"][worker_id], dict) else {}
+    status = entry.get("status") or "queued"
+    if status in (*RAN_STATUSES, "skipped") or state.get("status") not in ("running", "interrupted"):
+        return {"runDir": str(run_dir), "worker": worker_id, "status": status, "stopped": False}
+    worker_dir = run_dir / "workers" / worker_id
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    if steer is not None:
+        atomic_write_json(worker_dir / STEER_FILE, {"at": now_iso(), "message": steer})
+    atomic_write_text(worker_dir / STOP_FILE, now_iso() + "\n")
+    verified = True
+    if state.get("status") == "interrupted" or effective_run_state(state)["status"] == "interrupted":
+        verified = stop_recorded_pid(entry.get("pid"), entry.get("processStartTime"))
+    return {"runDir": str(run_dir), "worker": worker_id, "status": status, "stopped": True,
+            **({} if verified else {"unverifiedPid": entry.get("pid")})}
+
+
+def settled_outcome(run_dir: Path, worker_id: str, seconds: float) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + seconds
+    path = run_dir / "workers" / worker_id / "outcome.json"
+    while True:
+        outcome = read_optional_json(path)
+        if isinstance(outcome, dict) and outcome.get("finishedAt") and outcome.get("status") in (*RAN_STATUSES, "skipped"):
+            return outcome
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_SECONDS)
+
+
+def steer_task(message: str) -> str:
+    return ("The user stopped you mid-task to change course. Where this conflicts with your earlier brief, it wins:\n\n"
+            f"{message}\n\nContinue the same task from where you stopped, in the same working directory. Keep the work "
+            "already done unless the instruction says to undo it.")
+
+
+def steer_payload(folder: Path, worker_id: str, message: str, policy_path: Path,
+                  wait: float = STEER_WAIT_SECONDS) -> Dict[str, Any]:
+    """Stop one worker, then resume its own session, in its own worktree, with the user's correction."""
+    if not ID_PATTERN.fullmatch(worker_id):
+        raise PlanError(f"worker id {worker_id!r} is not safe")
+    message = message.strip() if isinstance(message, str) else ""
+    if not message:
+        raise PlanError("steer needs the instruction for the worker")
+    if len(message) > STEER_MESSAGE_LIMIT:
+        raise PlanError(f"the steer instruction is longer than {STEER_MESSAGE_LIMIT} characters; point to a file instead")
+    if not (folder / ORCHESTRATION_FILE).is_file():
+        raise PlanError("steer works on an orchestration started with new; this is a single run")
+    run_dir = worker_wave(folder, worker_id)
+    plan = read_optional_json(run_dir / "plan.json") or {}
+    entry = next((worker for worker in plan.get("workers", []) if worker.get("id") == worker_id), None)
+    if not isinstance(entry, dict):
+        raise PlanError(f"{run_dir / 'plan.json'} has no worker {worker_id}")
+    if not PROVIDER_CAPABILITIES.get(entry.get("provider"), {}).get("resume"):
+        raise PlanError(f"{entry.get('provider')} cannot resume a session; stop the wave and start the unit again")
+    stopped = stop_worker(folder, worker_id, message)
+    outcome = settled_outcome(run_dir, worker_id, wait)
+    if outcome is None:
+        raise PlanError(f"{worker_id} did not stop within {int(wait)}s; run steer again, or stop the wave")
+    session = outcome.get("sessionId")
+    if not session:
+        raise PlanError(f"{worker_id} ended before its CLI reported a session; start the unit again with a corrected brief")
+    item: Dict[str, Any] = {
+        "id": worker_id, "provider": entry["provider"], "mode": entry.get("mode", "read-only"),
+        "cwd": outcome.get("cwd") or outcome.get("originCwd"), "resume": session,
+        "task": steer_task(message), "why": f"steered by the user: {message}"[:NOTE_LIMITS["workerWhy"]],
+    }
+    for key in ("model", "effort", "timeoutSeconds", "idleTimeoutSeconds"):
+        if entry.get(key):
+            item[key] = entry[key]
+    if entry.get("mcp"):
+        item["mcp"] = True
+    if item["mode"] == "write":
+        item["permissions"] = entry.get("permissions") or "standard"
+    phase = plan.get("phase")
+    steer_plan: Dict[str, Any] = {"version": PLAN_VERSION, "title": plan.get("title") or worker_id,
+                                  "why": f"{worker_id} steered mid-run", "strategy": "rescue", "workers": [item]}
+    for key in ("playbook", "phase"):
+        if plan.get(key):
+            steer_plan[key] = plan[key]
+    plan_path = folder / f"steer-{worker_id}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    atomic_write_json(plan_path, steer_plan)
+    add_note(folder, f"{phase or worker_id}: {worker_id}: {message}"[:NOTE_LIMITS["note"]], "steer")
+    started = detach_run(plan_path, next_wave_dir(folder, phase or f"steer-{worker_id}"), policy_path, None)
+    return {"worker": worker_id, "stoppedWave": str(run_dir), "wasRunning": stopped["stopped"],
+            "sessionId": session, "plan": str(plan_path), **started}
 
 
 def stop_payload(folder: Path) -> Dict[str, Any]:
@@ -4905,11 +5038,81 @@ def mode_reminder(mode: Dict[str, Any], everywhere: bool) -> str:
         parts.append(MODE_FREESTYLE + " '/alethe off' turns this off here.")
         return " ".join(parts)
     parts.append(
-        "Follow the alethe skill for each request: do it yourself when that is cheaper, "
-        "delegate bounded units when it pays, and leave any other skill or spec workflow in charge of "
-        "its own steps. '/alethe off' turns this off here."
+        "Before your first edit on each request, decide with the alethe skill: does it split into two or more "
+        "bounded units, such as several files or areas, a sweep, code plus tests, or an independent review? "
+        "If yes, orchestrate it. If no, do it yourself and say why in one line, such as 'Keeping this: one-file "
+        "fix.' Doing it yourself feels faster is not a reason."
+    )
+    parts.append(MODE_ASK_FIRST if everywhere else MODE_GO_AHEAD)
+    parts.append(
+        "Leave any other skill or spec workflow in charge of its own steps and delegate its units. "
+        "'/alethe off' turns this off here."
     )
     return " ".join(parts)
+
+
+def claude_config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def alethe_hook_command(command: Any) -> bool:
+    text = command.lower() if isinstance(command, str) else ""
+    return "alethe" in text and "hook.py" in text
+
+
+def settings_have_hook(settings: Any) -> bool:
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    entries = hooks.get("UserPromptSubmit") if isinstance(hooks, dict) else None
+    return any(alethe_hook_command(hook.get("command"))
+               for entry in entries if isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
+               for hook in entry["hooks"] if isinstance(hook, dict)) if isinstance(entries, list) else False
+
+
+def claude_hook_installed(config: Path) -> bool:
+    """True when Claude Code will run Alethe's hook, through the plugin or the user's own settings."""
+    settings = [read_optional_json(config / name) for name in ("settings.json", "settings.local.json")]
+    if any(settings_have_hook(entry) for entry in settings):
+        return True
+    plugins = read_optional_json(config / "plugins" / "installed_plugins.json")
+    plugins = plugins.get("plugins") if isinstance(plugins, dict) else None
+    names = [name for name in plugins if name.startswith("alethe-orchestrate@")] if isinstance(plugins, dict) else []
+    enabled = settings[0].get("enabledPlugins") if isinstance(settings[0], dict) else None
+    enabled = enabled if isinstance(enabled, dict) else {}
+    return any(enabled.get(name) is not False for name in names)
+
+
+def hook_warning() -> Optional[str]:
+    config = claude_config_dir()
+    if not config.is_dir() or claude_hook_installed(config):
+        return None
+    return ("the Claude Code hook is not installed, so the mode is forgotten after this prompt and ends after "
+            "12 hours; 'hook --install' adds it to the user's Claude Code settings")
+
+
+def install_claude_hook() -> Dict[str, Any]:
+    config = claude_config_dir()
+    path = config / "settings.json"
+    if claude_hook_installed(config):
+        return {"installed": True, "changed": False, "settings": str(path)}
+    script = Path(__file__).absolute().with_name("hook.py")
+    if any(mark in str(script) for mark in '"$`'):
+        raise PlanError(f"cannot quote the hook path safely: {script}")
+    settings = read_json(path) if path.exists() else {}
+    hooks = settings.setdefault("hooks", {}) if isinstance(settings, dict) else None
+    if not isinstance(hooks, dict):
+        raise PlanError(f"{path} does not hold a settings object with a hooks object")
+    command = f'python3 -S "{script}" 2>/dev/null || python -S "{script}" 2>/dev/null || true'
+    for event, timeout in (("UserPromptSubmit", 10), ("PostToolUse", 5)):
+        entries = hooks.setdefault(event, [])
+        if not isinstance(entries, list):
+            raise PlanError(f"hooks.{event} in {path} is not a list")
+        entries.append({"hooks": [{"type": "command", "command": command, "timeout": timeout}]})
+    target = path.resolve()  # Settings kept in a dotfiles repo stay a symlink.
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    atomic_write_json(target, settings)
+    if mode is not None:
+        os.chmod(target, mode)
+    return {"installed": True, "changed": True, "settings": str(path)}
 
 
 def hook_stdin() -> str:
@@ -6417,6 +6620,9 @@ def doctor_payload(policy_path: Path) -> Dict[str, Any]:
         hints.append(f"the Jev classifier is {classifier['mode']} but has no key; put the OpenRouter key in {classifier['key']['path']}")
     elif classifier["key"]["private"] is False:
         hints.append(f"{classifier['key']['path']} is readable by other users; run chmod 600 on it")
+    warning = hook_warning()
+    if warning:
+        hints.append(warning)
     usage = usage_payload(policy_path, refresh=False)
     return {
         "classifier": classifier,
@@ -6769,6 +6975,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     note_parser.add_argument("--in", dest="into", type=Path, metavar="FOLDER")
     stop_parser = subparsers.add_parser("stop", help="stop the running waves of an orchestration")
     stop_parser.add_argument("folder", nargs="?", type=Path)
+    stop_parser.add_argument("--worker", help="stop only this worker; the rest of its wave keeps running")
+    steer_parser = subparsers.add_parser(
+        "steer", help="change a worker's course: stop it and resume its own session with the user's instruction"
+    )
+    steer_parser.add_argument("worker")
+    steer_parser.add_argument("message", help="the instruction, in the user's words")
+    steer_parser.add_argument("--in", dest="into", type=Path, metavar="FOLDER")
+    steer_parser.add_argument("--policy", type=Path)
+    steer_parser.add_argument("--wait", type=int, default=STEER_WAIT_SECONDS, metavar="SECONDS",
+                              help="how long to wait for the worker to stop")
     clean_parser = subparsers.add_parser("clean", help="preview or delete old, completed orchestration folders and runs")
     clean_parser.add_argument("--older-than", type=float, default=14, metavar="DAYS")
     clean_parser.add_argument("--yes", action="store_true", help="delete eligible folders")
@@ -6784,7 +7000,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     mode_parser.add_argument(
         "--everywhere", action="store_true", help="the default for every project; mode off still turns it off in one"
     )
-    subparsers.add_parser("hook", help="print due passive checks or explicit mode reminders; never fails")
+    hook_parser = subparsers.add_parser("hook", help="print due passive checks or explicit mode reminders; never fails")
+    hook_parser.add_argument("--install", action="store_true", help="add the hook to the user's Claude Code settings")
     spend_parser = subparsers.add_parser("spend", help="estimate lead and delegated Claude transcript spend at list price")
     spend_parser.add_argument("--transcript", type=Path)
     spend_parser.add_argument("--session")
@@ -6979,7 +7196,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             payload = mode_payload(
                 args.action, args.cwd, args.goal, args.care, args.rule, args.clear_rules, args.everywhere
             )
+            warning = hook_warning() if args.action == "on" else None
+            if warning:
+                payload["warning"] = warning
             print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "hook" and args.install:
+            print(json.dumps(install_claude_hook(), indent=2))
             return 0
         if args.command == "hook":
             try:
@@ -6992,7 +7215,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(payload, indent=2) if args.json else session_spend_text(payload), end="\n" if args.json else "")
             return 0
         if args.command == "stop":
+            if args.worker:
+                print(json.dumps(stop_worker(resolve_folder(args.folder), args.worker), indent=2))
+                return 0
             print(json.dumps(stop_payload(resolve_folder(args.folder)), indent=2))
+            return 0
+        if args.command == "steer":
+            if not 1 <= args.wait <= MAX_WAIT_SECONDS:
+                raise PlanError(f"--wait must be between 1 and {MAX_WAIT_SECONDS} seconds")
+            policy_path = (args.policy or default_policy_path()).expanduser().resolve()
+            print(json.dumps(steer_payload(resolve_folder(args.into), args.worker, args.message, policy_path, args.wait),
+                             indent=2, ensure_ascii=False))
             return 0
         if args.command == "clean":
             print(json.dumps(clean_payload(args.older_than, args.yes), indent=2))

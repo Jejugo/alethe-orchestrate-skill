@@ -89,7 +89,8 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `models` | `models`; show model prices, ranks and price freshness |
 | `editor`, or "show the playbooks" | `editor`, which writes the playbooks as a flow page and opens it; without Python, fill `assets/editor.html` as in [references/manual.md](references/manual.md) |
 | `list` | `list`; `use <folder>` makes one of them current again |
-| `stop` | `stop`, then `status` once the waves have ended |
+| `stop` | `stop`, then `status` once the waves have ended; `stop --worker <id>` stops one worker and leaves the rest of its wave running |
+| `steer <worker> <instruction>`, or the user asks to change what a running worker does | `steer <worker> "<the user's words>"`, then `wait` on the wave it starts |
 | `watch` | `watch` for the current orchestration: inside Herdr it opens one background tab for it, with a pipeline pane listing every playbook phase (done, running, next, skipped) and its workers, beside one live feed per worker of the current wave that changes as waves start; it reuses the tab while it is open and prints it. Elsewhere tell the user to run `scripts/orchestrate.py watch --here` in another terminal. Record a step you do yourself or skip with `note`, so the pipeline shows it |
 | `watch on`, `watch off` | `policy set --watch <it>`: with `on`, the first `run --detach` of an orchestration inside Herdr opens that tab by itself, later waves reuse it, and the JSON carries `watch`. The tab closes two minutes after the last wave ends (`policy set --watch-close-after SECONDS`, `0` keeps it open); a later wave opens a new one. Worker feeds show only what each agent says; `policy set --watch-feed all` adds every command and tool call |
 | `clean [--older-than DAYS] [--yes]` | preview completed folders older than 14 days; delete only with `--yes` |
@@ -97,6 +98,7 @@ action. Run-specific commands without a folder use the current orchestration: th
 | `skip <phase>`, `switch <playbook>`, `freeform`, `add <phase>` | change course as below |
 | `note <text>` | `note "<text>"` |
 | `mark <worker> used\|partial\|discarded` | `mark <worker> <mark>` |
+| `hook install` | only when the user asked: `hook --install`, which adds the reminder hook to their Claude Code settings |
 | `setup` | `doctor`, then onboarding when no policy is saved |
 | `help` | list these commands in a few lines |
 
@@ -138,13 +140,20 @@ See [references/playbooks.md](references/playbooks.md) for the optional `passive
 
 ## Stay on
 
-1. Use it proactively whenever a request splits into bounded independent units, even when nobody
-   mentions orchestration, as the description says. Before an unrequested multi-wave or multi-worker
-   orchestration, show a few lines of `dry-run` (playbook, workers, providers/models, estimate,
-   quota) and wait for an ok. This also applies under `balanced`, `save` and `max`; turning on a
-   goal alone is not approval. Exempt are passive one-worker delegations to subscription workers
-   with fresh room within `passive.askAboveWorkers`, explicitly requested orchestrations, and
-   standing instructions that say to go ahead. Small or tightly coupled work stays with you.
+1. Before your first edit on each request, decide whether it splits into two or more bounded units:
+   several files or areas, a sweep, code plus tests, or an independent review. If it does,
+   orchestrate it, even when nobody mentions orchestration. If it does not, keep it and say why in
+   one line: "Keeping this: one-file fix." Small or tightly coupled work stays with you; feeling
+   faster alone is not a reason to keep work that splits.
+
+   `/alethe on` in a project (goal `save`, `balanced` or `max`) approves orchestrating there: show
+   the playbook, workers and estimate in a few lines and start without waiting. Still ask first for
+   an API-billed or unknown-billing provider, a low provider, or a run past the budget or
+   `quota.stopAt`. Everywhere else, including `/alethe always`, show a few lines of `dry-run` before
+   an unrequested multi-wave or multi-worker orchestration and wait for an ok. Exempt there are
+   passive one-worker delegations to subscription workers with fresh room within
+   `passive.askAboveWorkers`, explicitly requested orchestrations, and standing instructions that
+   say to go ahead.
 2. `mode on --everywhere` applies in every project for 30 days from the last time it was set;
    calling it again renews it, and `mode show` reports `expiresAt`. After expiry the built-in
    passive default applies again. Passive itself does not expire. `mode off` turns it off here;
@@ -155,7 +164,7 @@ See [references/playbooks.md](references/playbooks.md) for the optional `passive
 Both modes take the same options:
 
 - `--goal save` spends as little as possible, `max` gets the most out of the available agents, and
-  `balanced` (the default) delegates only when the playbook says it pays.
+  `balanced` (the default) orchestrates work that splits into bounded units.
 - `--goal freestyle` drops playbooks, plans and waves: you work as usual and only watch over cost.
   Check quota before long or heavy steps. When a cheaper or better route exists, say so in one
   line, at most once per reply and not again once declined: "This rename is mechanical, so I'll
@@ -169,10 +178,12 @@ Both modes take the same options:
 
 Turn it on when the user says `/alethe on`, gives a standing instruction, or asks for orchestration
 "from now on". Map the instruction to a goal or care level when one fits, and keep the user's own
-words as a rule. Confirm in one line what is now on, then go back to what they were doing.
+words as a rule. Confirm in one line what is now on, then go back to what they were doing. When
+`mode on` returns `warning`, the hook is missing: tell the user in one line and offer `hook --install`,
+which edits their Claude Code settings, so run it only after they agree.
 
 The Claude Code hook reminds you every prompt in explicit non-passive modes; without it, run `mode show` at session start
-and after compaction. Delegate only where the overhead pays under the goal; keep small work yourself.
+and after compaction.
 
 ## Join mid-task
 
@@ -267,7 +278,19 @@ Record each change in one line before the next wave, so the report can explain i
 | add a phase or a worker | `note "<what>: <why>" --kind add` |
 | switch playbook, or go freeform | `note "to <playbook or freeform>: <why>" --kind switch` |
 | do a step yourself | `note "<what you did>" --kind lead` |
+| change a running worker's course | `steer <worker> "<instruction>"`, which records the note itself |
 | anything else | `note "<what changed and why>"` |
+
+A running worker cannot read new messages: its brief is fixed when it starts. When the user wants
+it to do something else, or you see it drift from the brief, run `steer <worker> "<instruction>"`
+at once instead of waiting for it to finish. It stops that worker only, waits for it to settle,
+then starts a `rescue` wave in the same phase that resumes the worker's own session, in its own
+worktree, with the same provider, model, effort and permissions, and the instruction as the new
+task. The worker keeps what it already read and wrote; the rest of its wave keeps running. Pass the
+user's words, plus any detail they need; it is recorded as a `steer` note. Then `wait` on the new
+wave. If it refuses (the CLI cannot resume, or the worker ended before reporting a session), stop
+the unit and start it again with a corrected brief. Never tell the user a worker cannot be
+interrupted.
 
 A freeform wave is an ordinary plan: leave `playbook` out and name the `phase` after what the wave
 does. Stop a wave that is no longer useful with `stop`; workers that already ran keep their results.
